@@ -1,0 +1,300 @@
+/*
+ * Copyright (c) 2022-2026 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package reactor.netty.http.client;
+
+import reactor.netty.resources.ConnectionProvider;
+
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+
+/**
+ * HTTP/2 {@link ConnectionProvider.AllocationStrategy}.
+ *
+ * <p>This class is based on
+ * https://github.com/reactor/reactor-pool/blob/d5cb5b72cdbcbbee8d781e06972c4da21766107f/src/main/java/reactor/pool/AllocationStrategies.java#L73
+ *
+ * @author Violeta Georgieva
+ * @since 1.0.20
+ */
+public final class Http2AllocationStrategy implements ConnectionProvider.AllocationStrategy<Http2AllocationStrategy> {
+
+	public interface Builder {
+
+		/**
+		 * Build a new {@link Http2AllocationStrategy}.
+		 *
+		 * @return a new {@link Http2AllocationStrategy}
+		 */
+		Http2AllocationStrategy build();
+
+		/**
+		 * Configures the maximum number of the concurrent streams that can be opened to the remote peer.
+		 * When evaluating how many streams can be opened to the remote peer,
+		 * the minimum of this configuration and the remote peer configuration is taken (unless -1 is used).
+		 * Default to {@code -1} - use always the remote peer configuration.
+		 *
+		 * @param maxConcurrentStreams the maximum number of the concurrent streams that can be opened to the remote peer
+		 * @return {@code this}
+		 */
+		Builder maxConcurrentStreams(long maxConcurrentStreams);
+
+		/**
+		 * Configures the maximum number of live connections to keep in the pool.
+		 * Default to {@link Integer#MAX_VALUE} - no upper limit.
+		 *
+		 * @param maxConnections the maximum number of live connections to keep in the pool
+		 * @return {@code this}
+		 */
+		Builder maxConnections(int maxConnections);
+
+		/**
+		 * Configures the minimum number of live connections to keep in the pool (can be the best effort).
+		 * When configured with a value greater than zero, the pool will also enable
+		 * {@link #strictConnectionReuse(boolean) strict connection reuse}.
+		 * Default to {@code 0}.
+		 *
+		 * @param minConnections the minimum number of live connections to keep in the pool
+		 * @return {@code this}
+		 * @see #strictConnectionReuse(boolean)
+		 */
+		Builder minConnections(int minConnections);
+
+		/**
+		 * Configures whether the HTTP/2 pool should avoid opening additional connections as long as
+		 * existing connections have not reached their max concurrent streams limit.
+		 * When enabled, the pool may operate with fewer connections (even a single one) and will only
+		 * allocate a new connection when all existing connections have reached their max concurrent streams.
+		 * <p>
+		 * This behavior is automatically enabled when {@link #minConnections(int)} is configured with a value
+		 * greater than zero. Use this option to enable the same behavior without setting a minimum connections constraint.
+		 * <p>
+		 * Default to {@code false}.
+		 *
+		 * @param strictConnectionReuse whether strict connection reuse should be enabled
+		 * @return {@code this}
+		 * @since 1.3.3
+		 */
+		default Builder strictConnectionReuse(boolean strictConnectionReuse) {
+			return this;
+		}
+
+		/**
+		 * Configures the maximum number of streams that can be opened at once when a suitable connection
+		 * is found in the pool. When the pool finds a connection that can be used for opening a stream,
+		 * instead of opening only one stream and then re-evaluating the available connections,
+		 * the pool will attempt to open up to {@code streamBatchSize} streams on that connection
+		 * (limited by the connection's available capacity, i.e. max concurrent streams minus current active streams).
+		 * <p>
+		 * This setting takes effect when strict connection reuse is active, either by enabling
+		 * {@code strictConnectionReuse(true)} or by setting {@code minConnections} to a value greater than zero.
+		 * <p>
+		 * Default to {@code 1} - open one stream at a time.
+		 *
+		 * @param streamBatchSize the maximum number of streams to open at once per connection
+		 * @return {@code this}
+		 * @since 1.3.4
+		 * @see #strictConnectionReuse(boolean)
+		 * @see #minConnections(int)
+		 */
+		default Builder streamBatchSize(int streamBatchSize) {
+			return this;
+		}
+	}
+
+	/**
+	 * Creates a builder for {@link Http2AllocationStrategy}.
+	 *
+	 * @return a new {@link Http2AllocationStrategy.Builder}
+	 */
+	public static Http2AllocationStrategy.Builder builder() {
+		return new Http2AllocationStrategy.Build();
+	}
+
+	@Override
+	public Http2AllocationStrategy copy() {
+		return new Http2AllocationStrategy(this);
+	}
+
+	@Override
+	public int estimatePermitCount() {
+		return PERMITS.get(this);
+	}
+
+	@Override
+	public int getPermits(int desired) {
+		if (desired < 0) {
+			return 0;
+		}
+
+		for (;;) {
+			int p = permits;
+			int target = Math.min(desired, p);
+
+			if (PERMITS.compareAndSet(this, p, p - target)) {
+				return target;
+			}
+		}
+	}
+
+	/**
+	 * Returns the configured maximum number of the concurrent streams that can be opened to the remote peer.
+	 *
+	 * @return the configured maximum number of the concurrent streams that can be opened to the remote peer
+	 */
+	public long maxConcurrentStreams() {
+		return maxConcurrentStreams;
+	}
+
+	/**
+	 * Returns the configured stream batch size.
+	 *
+	 * @return the configured stream batch size
+	 * @since 1.3.4
+	 */
+	public int streamBatchSize() {
+		return streamBatchSize;
+	}
+
+	/**
+	 * Returns whether strict HTTP/2 connection reuse (multiplexing) is enabled.
+	 *
+	 * @return whether strict connection reuse is enabled
+	 * @since 1.3.3
+	 */
+	public boolean strictConnectionReuse() {
+		return strictConnectionReuse;
+	}
+
+	@Override
+	public int permitGranted() {
+		return maxConnections - PERMITS.get(this);
+	}
+
+	@Override
+	public int permitMinimum() {
+		return minConnections;
+	}
+
+	@Override
+	public int permitMaximum() {
+		return maxConnections;
+	}
+
+	@Override
+	public void returnPermits(int returned) {
+		for (;;) {
+			int p = PERMITS.get(this);
+			if (p + returned > maxConnections) {
+				throw new IllegalArgumentException("Too many permits returned: returned=" + returned +
+						", would bring to " + (p + returned) + "/" + maxConnections);
+			}
+			if (PERMITS.compareAndSet(this, p, p + returned)) {
+				return;
+			}
+		}
+	}
+
+	final long maxConcurrentStreams;
+	final int maxConnections;
+	final int minConnections;
+	final int streamBatchSize;
+	final boolean strictConnectionReuse;
+
+	volatile int permits;
+	static final AtomicIntegerFieldUpdater<Http2AllocationStrategy> PERMITS = AtomicIntegerFieldUpdater.newUpdater(Http2AllocationStrategy.class, "permits");
+
+	Http2AllocationStrategy(Build build) {
+		this.maxConcurrentStreams = build.maxConcurrentStreams;
+		this.maxConnections = build.maxConnections;
+		this.minConnections = build.minConnections;
+		this.streamBatchSize = build.streamBatchSize;
+		this.strictConnectionReuse = build.strictConnectionReuse;
+		PERMITS.lazySet(this, this.maxConnections);
+	}
+
+	Http2AllocationStrategy(Http2AllocationStrategy copy) {
+		this.maxConcurrentStreams = copy.maxConcurrentStreams;
+		this.maxConnections = copy.maxConnections;
+		this.minConnections = copy.minConnections;
+		this.streamBatchSize = copy.streamBatchSize;
+		this.strictConnectionReuse = copy.strictConnectionReuse;
+		PERMITS.lazySet(this, this.maxConnections);
+	}
+
+	static final class Build implements Builder {
+		static final long DEFAULT_MAX_CONCURRENT_STREAMS = -1;
+		static final int DEFAULT_MAX_CONNECTIONS = Integer.MAX_VALUE;
+		static final int DEFAULT_MIN_CONNECTIONS = 0;
+		static final int DEFAULT_STREAM_BATCH_SIZE = 1;
+		static final boolean DEFAULT_STRICT_CONNECTION_REUSE = false;
+
+		long maxConcurrentStreams = DEFAULT_MAX_CONCURRENT_STREAMS;
+		int maxConnections = DEFAULT_MAX_CONNECTIONS;
+		int minConnections = DEFAULT_MIN_CONNECTIONS;
+		int streamBatchSize = DEFAULT_STREAM_BATCH_SIZE;
+		boolean strictConnectionReuse = DEFAULT_STRICT_CONNECTION_REUSE;
+
+		@Override
+		public Http2AllocationStrategy build() {
+			if (minConnections > maxConnections) {
+				throw new IllegalArgumentException("minConnections (" + minConnections + ")" +
+						" must be less than or equal to maxConnections (" + maxConnections + ")");
+			}
+			return new Http2AllocationStrategy(this);
+		}
+
+		@Override
+		public Builder maxConcurrentStreams(long maxConcurrentStreams) {
+			if (maxConcurrentStreams < -1) {
+				throw new IllegalArgumentException("maxConcurrentStreams must be greater than or equal to -1");
+			}
+			this.maxConcurrentStreams = maxConcurrentStreams;
+			return this;
+		}
+
+		@Override
+		public Builder maxConnections(int maxConnections) {
+			if (maxConnections < 1) {
+				throw new IllegalArgumentException("maxConnections must be strictly positive");
+			}
+			this.maxConnections = maxConnections;
+			return this;
+		}
+
+		@Override
+		public Builder minConnections(int minConnections) {
+			if (minConnections < 0) {
+				throw new IllegalArgumentException("minConnections must be positive or zero");
+			}
+			this.minConnections = minConnections;
+			return this;
+		}
+
+		@Override
+		public Builder streamBatchSize(int streamBatchSize) {
+			if (streamBatchSize < 1) {
+				throw new IllegalArgumentException("streamBatchSize must be strictly positive");
+			}
+			this.streamBatchSize = streamBatchSize;
+			return this;
+		}
+
+		@Override
+		public Builder strictConnectionReuse(boolean strictConnectionReuse) {
+			this.strictConnectionReuse = strictConnectionReuse;
+			return this;
+		}
+	}
+}

@@ -1,0 +1,2365 @@
+/*
+ * Copyright (c) 2021-2026 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package reactor.netty.http.client;
+
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerAdapter;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelId;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http2.Http2FrameCodec;
+import io.netty.handler.codec.http2.Http2FrameCodecBuilder;
+import io.netty.handler.codec.http2.Http2MultiplexHandler;
+import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.reactivestreams.Subscription;
+import reactor.core.Disposable;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import reactor.netty.Connection;
+import reactor.netty.http.Http2ConnectionLiveness;
+import reactor.netty.internal.shaded.reactor.pool.PoolAcquireTimeoutException;
+import reactor.netty.internal.shaded.reactor.pool.PoolBuilder;
+import reactor.netty.internal.shaded.reactor.pool.PoolConfig;
+import reactor.netty.internal.shaded.reactor.pool.PoolMetricsRecorder;
+import reactor.netty.internal.shaded.reactor.pool.PooledRef;
+import reactor.test.StepVerifier;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class Http2PoolTest {
+
+	@Test
+	void acquiredCountCorrectWhenDeliverRejectedNoStrictReuse() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(2)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			// Acquire first stream and keep it active (concurrency stays at 1)
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			http2Pool.acquire().doOnNext(acquired::add).block(Duration.ofSeconds(1));
+			assertThat(acquired).hasSize(1);
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) acquired.get(0)).slot;
+			assertThat(slot.concurrency()).as("concurrency after first stream").isEqualTo(1);
+
+			// Submit a second acquire. drainLoop() finds the connection, increments ACQUIRED to 2,
+			// and schedules deliver() on the event loop without pre-reserving concurrency (no strict reuse).
+			http2Pool.acquire().subscribe(acquired::add);
+
+			assertThat(acquired).as("second deliver should not have run yet").hasSize(1);
+			assertThat(http2Pool.activeStreams()).as("ACQUIRED: 1 active + 1 from drainLoop").isEqualTo(2);
+			// No pre-reservation in non-strict mode, concurrency stays at 1
+			assertThat(slot.concurrency()).as("concurrency not pre-reserved (no strict reuse)").isEqualTo(1);
+
+			// Simulate the remote peer lowering max concurrent streams to 1 (via SETTINGS frame)
+			// BEFORE the deliver() task run on the event loop.
+			Http2FrameCodec frameCodec = channel.pipeline().get(Http2FrameCodec.class);
+			frameCodec.connection().local().maxActiveStreams(1);
+			slot.updateMaxConcurrentStreams(1);
+
+			// Run pending tasks - the deliver() is rejected
+			channel.runPendingTasks();
+
+			// The second borrower should have been re-added to pending (deliver rejected it)
+			assertThat(acquired).as("second deliver should have been rejected").hasSize(1);
+			// ACQUIRED must be 1 - the rejected deliver() must have rolled back its pre-reserved increment
+			assertThat(http2Pool.activeStreams()).as("activeStreams: 1 active, 1 rolled back").isEqualTo(1);
+			// Concurrency unchanged at 1 (from the first active stream only, no pre-reservation was done)
+			assertThat(slot.concurrency()).as("concurrency unchanged at 1 (first active stream)").isEqualTo(1);
+
+			// Release the successfully acquired stream to bring concurrency down to 0
+			acquired.get(0).invalidate().block(Duration.ofSeconds(1));
+
+			channel.runPendingTasks();
+
+			// The rejected borrower was re-added to pending and drain() was triggered.
+			// deliver() runs and serves the borrower.
+			assertThat(acquired).as("both borrowers should now be served").hasSize(2);
+			assertThat(http2Pool.activeStreams()).as("activeStreams after second served").isEqualTo(1);
+
+			acquired.get(1).invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).as("activeStreams after invalidation").isEqualTo(0);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void goAwayReceivedUsesMemoizedConnection() throws Exception {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(2)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			PooledRef<Connection> ref = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(ref).isNotNull();
+			channel.runPendingTasks();
+
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) ref).slot;
+			Http2FrameCodec frameCodec = channel.pipeline().get(Http2FrameCodec.class);
+
+			// deliver() ran computeMaxConcurrentStreams() on the event loop, memoizing the connection
+			assertThat(slot.http2Connection).as("connection memoized on deliver")
+					.isSameAs(frameCodec.connection());
+			assertThat(slot.goAwayReceived()).as("no GO_AWAY yet").isFalse();
+
+			frameCodec.connection().goAwayReceived(Integer.MAX_VALUE, 0L, Unpooled.EMPTY_BUFFER);
+
+			assertThat(slot.goAwayReceived()).as("GO_AWAY read via the memoized connection").isTrue();
+
+			ref.invalidate().block(Duration.ofSeconds(1));
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void memoizesConnectionWhenFrameCodecIsInstalledAfterSlotCreation() throws Exception {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(), new ChannelHandlerAdapter() {});
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		try {
+			Http2Pool.Slot slot = http2Pool.createSlot(Connection.from(channel));
+			assertThat(slot.http2Connection).as("nothing to memoize pre-upgrade").isNull();
+			assertThat(slot.goAwayReceived()).as("pre-upgrade slot reports no GO_AWAY").isFalse();
+
+			// Stands in for the h2c upgrade, the one path where the codec joins the pipeline
+			// after the slot already exists.
+			Http2FrameCodec frameCodec = Http2FrameCodecBuilder.forClient().build();
+			channel.pipeline().addFirst(frameCodec);
+			channel.runPendingTasks();
+			slot.initMaxConcurrentStreams();
+
+			assertThat(slot.http2Connection).as("connection memoized by the post-upgrade re-init")
+					.isSameAs(frameCodec.connection());
+
+			frameCodec.connection().goAwayReceived(Integer.MAX_VALUE, 0L, Unpooled.EMPTY_BUFFER);
+
+			assertThat(slot.goAwayReceived()).as("GO_AWAY read via the memoized connection").isTrue();
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void h2cUpgradeNegativeLookupIsCached() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		try {
+			Http2Pool.Slot slot = http2Pool.createSlot(Connection.from(channel));
+			assertThat(slot.h2cUpgradeHandlerAbsent).as("not resolved yet").isFalse();
+
+			// No H2C upgrade handler in the pipeline (direct H2): the lookup misses...
+			assertThat(slot.isH2cUpgrade()).as("not an h2c upgrade").isFalse();
+
+			// ...and the negative result is cached so later calls skip the pipeline walk.
+			assertThat(slot.h2cUpgradeHandlerAbsent).as("negative lookup cached").isTrue();
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void acquiredCountCorrectWhenDeliverRejectedStrictReuse() {
+		acquiredCountCorrectWhenDeliverRejected(
+				Http2AllocationStrategy.builder()
+				                       .maxConnections(1)
+				                       .maxConcurrentStreams(2)
+				                       .strictConnectionReuse(true)
+				                       .build(), 2);
+	}
+
+	@Test
+	void acquiredCountCorrectWhenDeliverRejectedStreamBatchSize() {
+		acquiredCountCorrectWhenDeliverRejected(
+				Http2AllocationStrategy.builder()
+				                       .maxConnections(1)
+				                       .maxConcurrentStreams(3)
+				                       .strictConnectionReuse(true)
+				                       .streamBatchSize(3)
+				                       .build(), 3);
+	}
+
+	private static void acquiredCountCorrectWhenDeliverRejected(Http2AllocationStrategy strategy, int concurrentAcquires) {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			// Allocate a connection and cache it
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) warm).slot;
+			assertThat(slot.concurrency()).as("concurrency after warm-up").isEqualTo(1);
+
+			warm.release().block(Duration.ofSeconds(1));
+			assertThat(slot.concurrency()).as("concurrency after release").isEqualTo(0);
+
+			// Submit "concurrentAcquires" concurrent acquires.
+			// drainLoop() will pre-reserve concurrency for all of them and increment ACQUIRED by "concurrentAcquires".
+			// All deliver() tasks are queued on the event loop.
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			for (int i = 0; i < concurrentAcquires; i++) {
+				http2Pool.acquire().subscribe(acquired::add);
+			}
+
+			assertThat(acquired).as("deliver() tasks should not have run yet").isEmpty();
+			assertThat(http2Pool.activeStreams()).as("ACQUIRED pre-reserved for concurrentAcquires borrowers").isEqualTo(concurrentAcquires);
+			assertThat(slot.concurrency()).as("concurrency pre-reserved for concurrentAcquires borrowers").isEqualTo(concurrentAcquires);
+
+			// Simulate the remote peer lowering max concurrent streams to 1 (via SETTINGS frame)
+			// BEFORE the deliver() tasks run on the event loop.
+			slot.updateMaxConcurrentStreams(1);
+
+			channel.runPendingTasks();
+
+			// Only one borrower should have been served
+			assertThat(acquired).as("only one borrower should be served").hasSize(1);
+			// ACQUIRED must be 1 - the rejected deliver() must have rolled back its pre-reserved increment
+			assertThat(http2Pool.activeStreams()).as("activeStreams: 1 served, the others are rolled back").isEqualTo(1);
+			// Concurrency must be 1 - the rejected deliver() must have rolled back its pre-reserved concurrency
+			assertThat(slot.concurrency()).as("concurrency: 1 served, the others are rolled back").isEqualTo(1);
+
+			// Release the successfully acquired stream to bring concurrency down to 0
+			acquired.forEach(a -> a.invalidate().block(Duration.ofSeconds(1)));
+
+			channel.runPendingTasks();
+
+			// The rejected borrower was re-added to pending and drain() was triggered.
+			// deliver() runs and serves the borrower.
+			assertThat(acquired).as("2 borrowers should now be served").hasSize(2);
+			assertThat(http2Pool.activeStreams()).as("activeStreams after second served").isEqualTo(1);
+
+			acquired.forEach(a -> a.invalidate().block(Duration.ofSeconds(1)));
+
+			assertThat(http2Pool.activeStreams()).as("activeStreams after invalidation").isEqualTo(concurrentAcquires - 2);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void acquireInvalidate() {
+		EmbeddedChannel channel = new EmbeddedChannel(Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		try {
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+
+			channel.runPendingTasks();
+
+			assertThat(acquired).hasSize(3);
+			assertThat(http2Pool.activeStreams()).isEqualTo(3);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			for (PooledRef<Connection> slot : acquired) {
+				slot.invalidate().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			for (PooledRef<Connection> slot : acquired) {
+				// second invalidate() should be ignored and ACQUIRED size should remain the same
+				slot.invalidate().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void acquireRelease() {
+		EmbeddedChannel channel = new EmbeddedChannel(Http2FrameCodecBuilder.forClient().build(),
+				new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		try {
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+
+			channel.runPendingTasks();
+
+			assertThat(acquired).hasSize(3);
+			assertThat(http2Pool.activeStreams()).isEqualTo(3);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			for (PooledRef<Connection> slot : acquired) {
+				slot.release().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			for (PooledRef<Connection> slot : acquired) {
+				// second release() should be ignored and ACQUIRED size should remain the same
+				slot.release().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void strictReuseConcurrentAcquireReusesConnection() {
+		AtomicInteger allocator = new AtomicInteger();
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               allocator.incrementAndGet();
+				               EmbeddedChannel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               channels.add(channel);
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 2);
+		// Enable strict reuse so concurrent acquires do not allocate extra connections while a slot/allocation is in-flight.
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(2)
+				.strictConnectionReuse(true)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			// Warm-up: allocate a connection and cache it.
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+			warm.release().block(Duration.ofSeconds(1));
+
+			// Don't run pending tasks yet, simulate concurrent acquires before deliver is scheduled.
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+
+			assertThat(allocator).as("allocator count").hasValue(1);
+
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+
+			assertThat(acquired).hasSize(2);
+			assertThat(acquired.get(0).poolable())
+					.as("both acquires should share the same H2 connection")
+					.isSameAs(acquired.get(1).poolable());
+
+			for (PooledRef<Connection> ref : acquired) {
+				ref.release().block(Duration.ofSeconds(1));
+			}
+		}
+		finally {
+			for (EmbeddedChannel channel : channels) {
+				channel.finishAndReleaseAll();
+				Connection.from(channel).dispose();
+			}
+		}
+	}
+
+	@Test
+	void connectionLivenessCheckInProgressExcludesConnectionFromAcquisition() {
+		AtomicInteger allocator = new AtomicInteger();
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               allocator.incrementAndGet();
+				               EmbeddedChannel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               channels.add(channel);
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 2);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(2)
+				.maxConcurrentStreams(10)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			// Warm up one pooled connection and return it to the pool as idle.
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) warm).slot;
+			warm.release().block(Duration.ofSeconds(1));
+			assertThat(allocator).as("warm-up allocations").hasValue(1);
+
+			// A liveness check (HTTP/2 PING probe) is in progress on the cached connection.
+			slot.connectionLivenessCheckInProgress = true;
+
+			// Acquire while probing: the probed connection must not be handed out,
+			// so the pool allocates a fresh connection instead of reusing the cached one.
+			http2Pool.acquire().subscribe(acquired::add);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(acquired).hasSize(1);
+			assertThat(acquired.get(0).poolable())
+					.as("must not reuse the connection being probed")
+					.isNotSameAs(warm.poolable());
+			assertThat(allocator).as("a fresh connection is allocated while probing").hasValue(2);
+
+			// Probe finished (ACK received): the connection is re-admitted; reuse resumes with no new allocation.
+			slot.connectionLivenessCheckInProgress = false;
+			acquired.get(0).release().block(Duration.ofSeconds(1));
+			http2Pool.acquire().subscribe(acquired::add);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(acquired).hasSize(2);
+			assertThat(allocator).as("re-admitted connection is reused, no new allocation").hasValue(2);
+		}
+		finally {
+			for (EmbeddedChannel channel : channels) {
+				channel.finishAndReleaseAll();
+				Connection.from(channel).dispose();
+			}
+		}
+	}
+
+	@Test
+	void connectionLivenessProbeTogglesExclusionFlagThroughChannelAttribute() {
+		AtomicInteger allocator = new AtomicInteger();
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               allocator.incrementAndGet();
+				               EmbeddedChannel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               channels.add(channel);
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 2);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(2)
+				.maxConcurrentStreams(10)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			// Warm up one pooled connection and return it to the pool as idle.
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) warm).slot;
+			EmbeddedChannel channel = channels.peek();
+			assertThat(channel).isNotNull();
+			warm.release().block(Duration.ofSeconds(1));
+			assertThat(allocator).as("warm-up allocations").hasValue(1);
+
+			// Wire the production seam exactly as the pool does: install the listener under the channel
+			// attribute, then drive a real PING liveness probe on that channel through the handler.
+			Http2ConnectionProvider.DisposableAcquire.installConnectionLivenessCheckListener(channel, slot, http2Pool);
+			Http2FrameCodec frameCodec = channel.pipeline().get(Http2FrameCodec.class);
+			ChannelHandlerContext frameCodecCtx = channel.pipeline().context(Http2FrameCodec.class);
+			Http2ConnectionLiveness liveness =
+					new Http2ConnectionLiveness(frameCodec, 1, Duration.ofSeconds(1).toNanos());
+
+			assertThat(slot.connectionLivenessCheckInProgress).as("no probe in progress yet").isFalse();
+
+			// Probe starts: the handler reads the listener from the channel attribute and flips the flag.
+			liveness.check(frameCodecCtx);
+			channel.runPendingTasks();
+			assertThat(slot.connectionLivenessCheckInProgress)
+					.as("probe start excludes the connection through the channel attribute")
+					.isTrue();
+
+			// The flag was flipped through the real wiring, so the pool must not hand the connection out.
+			http2Pool.acquire().subscribe(acquired::add);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(acquired).hasSize(1);
+			assertThat(acquired.get(0).poolable())
+					.as("must not reuse the connection being probed")
+					.isNotSameAs(warm.poolable());
+			assertThat(allocator).as("a fresh connection is allocated while probing").hasValue(2);
+
+			// Probe ends (PING ACK received): the handler clears the flag through the channel attribute,
+			// re-admitting the connection and draining pending acquires.
+			liveness.cancel();
+			assertThat(slot.connectionLivenessCheckInProgress)
+					.as("probe end re-admits the connection through the channel attribute")
+					.isFalse();
+		}
+		finally {
+			for (EmbeddedChannel channel : channels) {
+				channel.finishAndReleaseAll();
+				Connection.from(channel).dispose();
+			}
+		}
+	}
+
+	@Test
+	void connectionLivenessProbeCompletionDrainsPendingAcquire() {
+		AtomicInteger allocator = new AtomicInteger();
+		ConcurrentLinkedQueue<EmbeddedChannel> channels = new ConcurrentLinkedQueue<>();
+
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               allocator.incrementAndGet();
+				               EmbeddedChannel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               channels.add(channel);
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(10)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			// Warm up the single pooled connection and return it to the pool as idle.
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) warm).slot;
+			EmbeddedChannel channel = channels.peek();
+			assertThat(channel).isNotNull();
+			warm.release().block(Duration.ofSeconds(1));
+			assertThat(allocator).as("warm-up allocations").hasValue(1);
+
+			// Install the production seam and start a real PING liveness probe on the only connection.
+			Http2ConnectionProvider.DisposableAcquire.installConnectionLivenessCheckListener(channel, slot, http2Pool);
+			Http2FrameCodec frameCodec = channel.pipeline().get(Http2FrameCodec.class);
+			ChannelHandlerContext frameCodecCtx = channel.pipeline().context(Http2FrameCodec.class);
+			Http2ConnectionLiveness liveness =
+					new Http2ConnectionLiveness(frameCodec, 1, Duration.ofSeconds(1).toNanos());
+
+			liveness.check(frameCodecCtx);
+			channel.runPendingTasks();
+			assertThat(slot.connectionLivenessCheckInProgress).as("probe in progress").isTrue();
+
+			// Acquire while probing: the only connection is excluded and the pool is at capacity,
+			// so the borrower parks pending rather than being served or allocating a new connection.
+			http2Pool.acquire().subscribe(acquired::add);
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(acquired).as("borrower parks while the only connection is probed").isEmpty();
+			assertThat(allocator).as("no new connection allocated at max capacity").hasValue(1);
+
+			// Probe completes (PING ACK): the listener clears the flag and drains the pool, which
+			// re-admits the connection and serves the parked borrower without waiting for a later poll.
+			liveness.cancel();
+			channels.forEach(EmbeddedChannel::runPendingTasks);
+			assertThat(acquired).as("probe completion drains and serves the pending borrower").hasSize(1);
+			assertThat(acquired.get(0).poolable())
+					.as("the parked borrower is served by the re-admitted connection")
+					.isSameAs(warm.poolable());
+			assertThat(allocator).as("served by re-admission, not a new allocation").hasValue(1);
+		}
+		finally {
+			for (EmbeddedChannel channel : channels) {
+				channel.finishAndReleaseAll();
+				Connection.from(channel).dispose();
+			}
+		}
+	}
+
+	@Test
+	void deliverDoesNotDeactivateInvalidatedSlot() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(), new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(10)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			http2Pool.acquire().doOnNext(acquired::add).block(Duration.ofSeconds(1));
+			assertThat(acquired).hasSize(1);
+
+			Http2Pool.Slot slot = ((Http2Pool.Http2PooledRef) acquired.get(0)).slot;
+
+			// Second acquire — drainLoop() increments ACQUIRED and schedules deliver()
+			http2Pool.acquire().subscribe(acquired::add);
+
+			// Invalidate the slot BEFORE deliver() runs on the event loop.
+			slot.invalidate();
+
+			channel.runPendingTasks();
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+			assertThat(connections).doesNotContain(slot);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void doAcquireNotCalledIfBorrowerInScopeCancelledEarly() {
+		AtomicInteger allocator = new AtomicInteger();
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               allocator.incrementAndGet();
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }));
+
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		assertThat(allocator).as("before invoking acquire").hasValue(0);
+
+		// Borrower is in state cancelled before the actual acquisition
+		http2Pool.acquire().doOnSubscribe(Subscription::cancel).subscribe();
+
+		assertThat(allocator).as("after invoking acquire").hasValue(0);
+	}
+
+	@Test
+	void evictClosedConnection() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired1.poolable();
+			ChannelId id1 = connection.channel().id();
+			CountDownLatch latch = new CountDownLatch(1);
+			((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+			connection.onDispose(latch::countDown);
+			connection.dispose();
+
+			assertThat(latch.await(1, TimeUnit.SECONDS)).as("latch await").isTrue();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired2.poolable();
+			ChannelId id2 = connection.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictClosedConnectionMaxConnectionsNotReached_1() throws Exception {
+		evictClosedConnectionMaxConnectionsNotReached(false);
+	}
+
+	@Test
+	void evictClosedConnectionMaxConnectionsNotReached_2() throws Exception {
+		evictClosedConnectionMaxConnectionsNotReached(true);
+	}
+
+	private static void evictClosedConnectionMaxConnectionsNotReached(boolean closeSecond) throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 2);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			connection = acquired1.poolable();
+			ChannelId id1 = connection.channel().id();
+			CountDownLatch latch = new CountDownLatch(1);
+			((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+			connection.onDispose(latch::countDown);
+			connection.dispose();
+
+			assertThat(latch.await(1, TimeUnit.SECONDS)).as("latch await").isTrue();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(acquired2).isNotNull();
+
+			AtomicReference<PooledRef<Connection>> acquired3 = new AtomicReference<>();
+			http2Pool.acquire().subscribe(acquired3::set);
+
+			connection = acquired2.poolable();
+			((EmbeddedChannel) connection.channel()).runPendingTasks();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(3);
+			assertThat(connections.size()).isEqualTo(2);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(2L * Integer.MAX_VALUE);
+
+			if (closeSecond) {
+				latch = new CountDownLatch(1);
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.onDispose(latch::countDown);
+				connection.dispose();
+
+				assertThat(latch.await(1, TimeUnit.SECONDS)).as("latch await").isTrue();
+			}
+
+			ChannelId id2 = connection.channel().id();
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			acquired3.get().invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			if (closeSecond) {
+				assertThat(connections.size()).isEqualTo(0);
+				assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+			}
+			else {
+				assertThat(connections.size()).isEqualTo(1);
+				assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+			}
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictClosedConnectionMaxConnectionsReached() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired1.poolable();
+			CountDownLatch latch = new CountDownLatch(1);
+			((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+			connection.onDispose(latch::countDown);
+			connection.dispose();
+
+			assertThat(latch.await(1, TimeUnit.SECONDS)).as("latch await").isTrue();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			http2Pool.acquire(Duration.ofMillis(10))
+			         .as(StepVerifier::create)
+			         .expectError(PoolAcquireTimeoutException.class)
+			         .verify(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictInBackgroundClosedConnection() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictInBackground(Duration.ofSeconds(5));
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired1.poolable();
+			ChannelId id1 = connection.channel().id();
+			CountDownLatch latch = new CountDownLatch(1);
+			((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+			connection.onDispose(latch::countDown);
+			connection.dispose();
+
+			assertThat(latch.await(1, TimeUnit.SECONDS)).as("latch await").isTrue();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired2.poolable();
+			ChannelId id2 = connection.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictInBackgroundMaxIdleTime() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictInBackground(Duration.ofSeconds(5))
+				           .evictionPredicate((conn, meta) -> meta.idleTime() >= 10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			Thread.sleep(15);
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			Thread.sleep(15);
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictInBackgroundMaxLifeTime() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictInBackground(Duration.ofSeconds(5))
+				           .evictionPredicate((conn, meta) -> meta.lifeTime() >= 10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			Thread.sleep(10);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			Thread.sleep(10);
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictInBackgroundEvictionPredicate() {
+		final AtomicBoolean shouldEvict = new AtomicBoolean(false);
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+							Channel channel = new EmbeddedChannel(
+									new TestChannelId(),
+									Http2FrameCodecBuilder.forClient().build());
+							return Connection.from(channel);
+						}))
+						.idleResourceReuseLruOrder()
+						.maxPendingAcquireUnbounded()
+						.sizeBetween(0, 1)
+						.evictInBackground(Duration.ofSeconds(5))
+						.evictionPredicate((conn, metadata) -> shouldEvict.get());
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			shouldEvict.set(true);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			shouldEvict.set(false);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			shouldEvict.set(true);
+
+			http2Pool.evictInBackground();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxIdleTime() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictionPredicate((conn, meta) -> meta.idleTime() >= 10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			Thread.sleep(15);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxIdleTimeActiveStreams() throws Exception {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(), new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictionPredicate((conn, meta) -> meta.idleTime() >= 10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			http2Pool.acquire().subscribe(acquired::add);
+			http2Pool.acquire().subscribe(acquired::add);
+
+			channel.runPendingTasks();
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired).hasSize(2);
+			assertThat(http2Pool.activeStreams()).isEqualTo(2);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			connection1 = acquired.get(0).poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			acquired.get(0).invalidate().block(Duration.ofSeconds(1));
+
+			Thread.sleep(15);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			connection2 = acquired.get(1).poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isEqualTo(id2);
+
+			acquired.get(1).invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxLifeTime() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictionPredicate((conn, meta) -> meta.lifeTime() >= 10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			Thread.sleep(10);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxLifeTimeWithVariance() {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .maxLifeTime(Duration.ofMillis(100))
+				           .maxLifeTimeVariance(10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			connection1 = acquired1.poolable();
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+			assertThat(connections.size()).isEqualTo(1);
+			Http2Pool.Slot slot = connections.peek();
+			assertThat(slot).isNotNull();
+			assertThat(slot.maxLifeTimeMs).isBetween(90L, 100L);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxLifeTimeWithVarianceEviction() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .maxLifeTime(Duration.ofMillis(50))
+				           .maxLifeTimeVariance(10);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			connection1 = acquired1.poolable();
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+			assertThat(connections.size()).isEqualTo(1);
+
+			Thread.sleep(60);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			connection2 = acquired2.poolable();
+
+			assertThat(connection1.channel().id()).isNotEqualTo(connection2.channel().id());
+
+			assertThat(connections.size()).isEqualTo(1);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@ParameterizedTest
+	@ValueSource(longs = {0, 60_000})
+	void slotMaxLifeTimeMsWithoutVariance(long maxLifeTimeMs) {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		if (maxLifeTimeMs > 0) {
+			poolBuilder = poolBuilder.maxLifeTime(Duration.ofMillis(maxLifeTimeMs));
+		}
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(acquired).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			connection = acquired.poolable();
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+			assertThat(connections.size()).isEqualTo(1);
+			Http2Pool.Slot slot = connections.peek();
+			assertThat(slot).isNotNull();
+			assertThat(slot.maxLifeTimeMs).isEqualTo(maxLifeTimeMs);
+
+			acquired.invalidate().block(Duration.ofSeconds(1));
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void evictionPredicate() {
+		final AtomicBoolean shouldEvict = new AtomicBoolean(false);
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+							Channel channel = new EmbeddedChannel(
+									new TestChannelId(),
+									Http2FrameCodecBuilder.forClient().build());
+							return Connection.from(channel);
+						}))
+						.idleResourceReuseLruOrder()
+						.maxPendingAcquireUnbounded()
+						.sizeBetween(0, 1)
+						.evictionPredicate((conn, metadata) -> shouldEvict.get());
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			shouldEvict.set(true);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			shouldEvict.set(false);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxLifeTimeMaxConnectionsNotReached() throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 2)
+				           .evictionPredicate((conn, meta) -> meta.lifeTime() >= 50);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection1 = null;
+		Connection connection2 = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection1 = acquired1.poolable();
+			ChannelId id1 = connection1.channel().id();
+
+			Thread.sleep(50);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			PooledRef<Connection> acquired2 = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired2).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(2);
+			assertThat(connections.size()).isEqualTo(2);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection2 = acquired2.poolable();
+			ChannelId id2 = connection2.channel().id();
+
+			assertThat(id1).isNotEqualTo(id2);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+			acquired2.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection1 != null) {
+				((EmbeddedChannel) connection1.channel()).finishAndReleaseAll();
+				connection1.dispose();
+			}
+			if (connection2 != null) {
+				((EmbeddedChannel) connection2.channel()).finishAndReleaseAll();
+				connection2.dispose();
+			}
+		}
+	}
+
+	@Test
+	void maxLifeTimeMaxConnectionsReached() throws Exception {
+		doMaxLifeTimeMaxConnectionsReached(null);
+	}
+
+	@Test
+	void maxLifeTimeMaxConnectionsReachedWithCustomTimer() throws Exception {
+		CountDownLatch latch = new CountDownLatch(1);
+		BiFunction<Runnable, Duration, Disposable> timer = (r, d) -> {
+			Runnable wrapped = () -> {
+				r.run();
+				latch.countDown();
+			};
+			return Schedulers.single().schedule(wrapped, d.toNanos(), TimeUnit.NANOSECONDS);
+		};
+		doMaxLifeTimeMaxConnectionsReached(timer);
+		assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
+	}
+
+	private static void doMaxLifeTimeMaxConnectionsReached(@Nullable BiFunction<Runnable, Duration, Disposable> pendingAcquireTimer)
+			throws Exception {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1)
+				           .evictionPredicate((conn, meta) -> meta.lifeTime() >= 10);
+		if (pendingAcquireTimer != null) {
+			poolBuilder = poolBuilder.pendingAcquireTimer(pendingAcquireTimer);
+		}
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		Connection connection = null;
+		try {
+			PooledRef<Connection> acquired1 = http2Pool.acquire().block(Duration.ofSeconds(1));
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(acquired1).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			connection = acquired1.poolable();
+
+			Thread.sleep(10);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			http2Pool.acquire(Duration.ofMillis(10))
+			         .as(StepVerifier::create)
+			         .expectError(PoolAcquireTimeoutException.class)
+			         .verify(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(connections.size()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			acquired1.invalidate().block(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			if (connection != null) {
+				((EmbeddedChannel) connection.channel()).finishAndReleaseAll();
+				connection.dispose();
+			}
+		}
+	}
+
+	@Test
+	void minConnections() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(), new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(1, 3);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(3)
+				.minConnections(1)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			Flux.range(0, 3)
+			    .flatMap(i -> http2Pool.acquire().doOnNext(acquired::add))
+			    .subscribe();
+
+			channel.runPendingTasks();
+
+			assertThat(acquired).hasSize(3);
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(3);
+			assertThat(acquired.get(0).poolable()).isSameAs(acquired.get(1).poolable());
+			assertThat(acquired.get(0).poolable()).isSameAs(acquired.get(2).poolable());
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+
+			for (PooledRef<Connection> slot : acquired) {
+				slot.release().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(Integer.MAX_VALUE);
+		}
+		finally {
+			for (PooledRef<Connection> slot : acquired) {
+				Connection conn = slot.poolable();
+				((EmbeddedChannel) conn.channel()).finishAndReleaseAll();
+				conn.dispose();
+			}
+		}
+	}
+
+	@Test
+	void minConnectionsMaxStreamsReached() {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               Channel channel = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build());
+				               return Connection.from(channel);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(1, 3);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(3)
+				.minConnections(1)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> acquired = new ArrayList<>();
+		try {
+			Flux.range(0, 3)
+			    .flatMap(i -> http2Pool.acquire().doOnNext(acquired::add))
+			    .blockLast(Duration.ofSeconds(1));
+
+			assertThat(acquired).hasSize(3);
+
+			for (PooledRef<Connection> pooledRef : acquired) {
+				((EmbeddedChannel) pooledRef.poolable().channel()).runPendingTasks();
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(3);
+			assertThat(acquired.get(0).poolable()).isNotSameAs(acquired.get(1).poolable());
+			assertThat(acquired.get(0).poolable()).isNotSameAs(acquired.get(2).poolable());
+			assertThat(acquired.get(1).poolable()).isNotSameAs(acquired.get(2).poolable());
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			for (PooledRef<Connection> slot : acquired) {
+				slot.release().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			for (PooledRef<Connection> slot : acquired) {
+				Connection conn = slot.poolable();
+				((EmbeddedChannel) conn.channel()).finishAndReleaseAll();
+				conn.dispose();
+			}
+		}
+	}
+
+	@Test
+	void nonHttp2ConnectionEmittedOnce() {
+		EmbeddedChannel channel = new EmbeddedChannel();
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		try {
+			PooledRef<Connection> acquired = http2Pool.acquire().block(Duration.ofSeconds(1));
+
+			assertThat(acquired).isNotNull();
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+
+			http2Pool.acquire(Duration.ofMillis(10))
+			         .as(StepVerifier::create)
+			         .expectError(PoolAcquireTimeoutException.class)
+			         .verify(Duration.ofSeconds(1));
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(1);
+
+			acquired.invalidate().block(Duration.ofSeconds(1));
+
+			ConcurrentLinkedQueue<Http2Pool.Slot> connections = http2Pool.connections;
+			assertThat(connections).isNotNull();
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+			assertThat(connections.size()).isEqualTo(0);
+			assertThat(http2Pool.totalMaxConcurrentStreams).isEqualTo(0);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void pendingTimeout() throws Exception {
+		EmbeddedChannel channel = new EmbeddedChannel();
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .maxPendingAcquire(10)
+				           .sizeBetween(0, 1);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, null));
+
+		CountDownLatch latch = new CountDownLatch(3);
+		ExecutorService executorService = Executors.newFixedThreadPool(20);
+		try {
+			CompletableFuture<?>[] completableFutures = new CompletableFuture<?>[4];
+			for (int i = 0; i < completableFutures.length; i++) {
+				completableFutures[i] = CompletableFuture.runAsync(
+						() -> http2Pool.acquire(Duration.ofMillis(10))
+								.doOnEach(sig -> channel.runPendingTasks())
+								.doOnError(t -> latch.countDown())
+								.onErrorResume(PoolAcquireTimeoutException.class, t -> Mono.empty())
+								.block(),
+						executorService);
+			}
+
+			CompletableFuture.allOf(completableFutures).join();
+			assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue();
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+			executorService.shutdown();
+		}
+	}
+
+	@Test
+	void recordsPendingCountAndLatencies() {
+		EmbeddedChannel channel = new EmbeddedChannel(new TestChannelId(),
+				Http2FrameCodecBuilder.forClient().build(), new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+		TestPoolMetricsRecorder recorder = new TestPoolMetricsRecorder();
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.just(Connection.from(channel)))
+				           .metricsRecorder(recorder)
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 1);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(1)
+				.maxConcurrentStreams(2)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		try {
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			//success, acquisition happens immediately
+			http2Pool.acquire(Duration.ofMillis(1)).subscribe(acquired::add);
+			// success, acquisition happens immediately without timeout
+			http2Pool.acquire().subscribe(acquired::add);
+
+			channel.runPendingTasks();
+
+			assertThat(acquired).hasSize(2);
+
+			//success, acquisition happens after pending some time
+			http2Pool.acquire(Duration.ofSeconds(1)).subscribe();
+
+			// success, acquisition happens after pending some time without timeout
+			http2Pool.acquire().subscribe();
+
+			//error, timed out
+			http2Pool.acquire(Duration.ofMillis(50))
+			         .as(StepVerifier::create)
+			         .expectError(PoolAcquireTimeoutException.class)
+			         .verify(Duration.ofSeconds(1));
+
+			acquired.get(0).release().block(Duration.ofSeconds(1));
+			acquired.get(1).release().block(Duration.ofSeconds(1));
+
+			channel.runPendingTasks();
+
+			assertThat(recorder.pendingSuccessCounter)
+					.as("pending success")
+					.isEqualTo(2);
+
+			assertThat(recorder.pendingErrorCounter)
+					.as("pending errors")
+					.isEqualTo(1);
+
+			assertThat(recorder.pendingSuccessLatency)
+					.as("pending success latency")
+					.isGreaterThanOrEqualTo(1L);
+
+			assertThat(recorder.pendingErrorLatency)
+					.as("pending error latency")
+					.isGreaterThanOrEqualTo(1L);
+		}
+		finally {
+			channel.finishAndReleaseAll();
+			Connection.from(channel).dispose();
+		}
+	}
+
+	@Test
+	void streamBatchSizeDefault() {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               EmbeddedChannel ch = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               return Connection.from(ch);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(2, 2);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(2)
+				.minConnections(2)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> warmup = new ArrayList<>();
+		try {
+			Flux.range(1, 2)
+			    .flatMap(i -> http2Pool.acquire().doOnNext(warmup::add))
+			    .blockLast(Duration.ofSeconds(1));
+
+			assertThat(warmup).hasSize(2);
+			assertThat(warmup.get(0).poolable()).isNotSameAs(warmup.get(1).poolable());
+			warmup.get(0).release().block(Duration.ofSeconds(1));
+			warmup.get(1).release().block(Duration.ofSeconds(1));
+
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			for (int i = 0; i < 4; i++) {
+				http2Pool.acquire()
+				         .doOnSubscribe(s -> warmup.forEach(ref -> ((EmbeddedChannel) ref.poolable().channel()).runPendingTasks()))
+				         .subscribe(acquired::add);
+			}
+			warmup.forEach(ref -> ((EmbeddedChannel) ref.poolable().channel()).runPendingTasks());
+
+			assertThat(acquired).hasSize(4);
+			assertThat(http2Pool.activeStreams()).isEqualTo(4);
+			Connection conn0 = acquired.get(0).poolable();
+			Connection conn1 = acquired.get(1).poolable();
+			assertThat(conn0).as("streams 0 and 1 should be on different connections").isNotSameAs(conn1);
+			assertThat(acquired.get(2).poolable()).as("stream 2 same as stream 0").isSameAs(conn0);
+			assertThat(acquired.get(3).poolable()).as("stream 3 same as stream 1").isSameAs(conn1);
+
+			for (PooledRef<Connection> ref : acquired) {
+				ref.invalidate().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+		}
+		finally {
+			for (PooledRef<Connection> ref : warmup) {
+				EmbeddedChannel ch = (EmbeddedChannel) ref.poolable().channel();
+				ch.finishAndReleaseAll();
+				Connection.from(ch).dispose();
+			}
+		}
+	}
+
+	@Test
+	void streamBatchSizeLimitedByMaxConcurrentStreams() {
+		streamBatchSize(
+				Http2AllocationStrategy.builder()
+				                       .maxConnections(2)
+				                       .minConnections(2)
+				                       .maxConcurrentStreams(2)
+				                       .streamBatchSize(3)
+				                       .build());
+	}
+
+	@Test
+	void streamBatchSizeOpenMultipleStreamsOnSameConnection() {
+		streamBatchSize(
+				Http2AllocationStrategy.builder()
+				                       .maxConnections(2)
+				                       .minConnections(2)
+				                       .streamBatchSize(2)
+				                       .build());
+	}
+
+	private static void streamBatchSize(Http2AllocationStrategy strategy) {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               EmbeddedChannel ch = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               return Connection.from(ch);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(2, 2);
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		List<PooledRef<Connection>> warmup = new ArrayList<>();
+		try {
+			Flux.range(1, 2)
+			    .flatMap(i -> http2Pool.acquire().doOnNext(warmup::add))
+			    .blockLast(Duration.ofSeconds(1));
+
+			assertThat(warmup).hasSize(2);
+			assertThat(warmup.get(0).poolable()).isNotSameAs(warmup.get(1).poolable());
+			warmup.get(0).release().block(Duration.ofSeconds(1));
+			warmup.get(1).release().block(Duration.ofSeconds(1));
+
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			for (int i = 0; i < 4; i++) {
+				http2Pool.acquire().subscribe(acquired::add);
+			}
+			warmup.forEach(ref -> ((EmbeddedChannel) ref.poolable().channel()).runPendingTasks());
+
+			assertThat(acquired).hasSize(4);
+			assertThat(http2Pool.activeStreams()).isEqualTo(4);
+			Connection conn0 = acquired.get(0).poolable();
+			Connection conn2 = acquired.get(2).poolable();
+			assertThat(conn0).as("streams 0 and 2 should be on different connections").isNotSameAs(conn2);
+			assertThat(acquired.get(1).poolable()).as("stream 1 same as stream 0").isSameAs(conn0);
+			assertThat(acquired.get(3).poolable()).as("stream 3 same as stream 2").isSameAs(conn2);
+
+			for (PooledRef<Connection> ref : acquired) {
+				ref.invalidate().block(Duration.ofSeconds(1));
+			}
+
+			assertThat(http2Pool.activeStreams()).isEqualTo(0);
+		}
+		finally {
+			for (PooledRef<Connection> ref : warmup) {
+				EmbeddedChannel ch = (EmbeddedChannel) ref.poolable().channel();
+				ch.finishAndReleaseAll();
+				Connection.from(ch).dispose();
+			}
+		}
+	}
+
+	@Test
+	void streamBatchSizeWithStrictReuse() {
+		PoolBuilder<Connection, PoolConfig<Connection>> poolBuilder =
+				PoolBuilder.from(Mono.fromSupplier(() -> {
+				               EmbeddedChannel ch = new EmbeddedChannel(
+				                   new TestChannelId(),
+				                   Http2FrameCodecBuilder.forClient().build(),
+				                   new Http2MultiplexHandler(new ChannelHandlerAdapter() {}));
+				               return Connection.from(ch);
+				           }))
+				           .idleResourceReuseLruOrder()
+				           .maxPendingAcquireUnbounded()
+				           .sizeBetween(0, 5);
+		Http2AllocationStrategy strategy = Http2AllocationStrategy.builder()
+				.maxConnections(5)
+				.strictConnectionReuse(true)
+				.streamBatchSize(4)
+				.build();
+		Http2Pool http2Pool = poolBuilder.build(config -> new Http2Pool(config, strategy));
+
+		EmbeddedChannel ch = null;
+		try {
+			PooledRef<Connection> warm = http2Pool.acquire().block(Duration.ofSeconds(1));
+			assertThat(warm).isNotNull();
+			warm.release().block(Duration.ofSeconds(1));
+
+			ch = (EmbeddedChannel) warm.poolable().channel();
+
+			List<PooledRef<Connection>> acquired = new ArrayList<>();
+			for (int i = 0; i < 4; i++) {
+				http2Pool.acquire().subscribe(acquired::add);
+			}
+
+			ch.runPendingTasks();
+
+			assertThat(acquired).hasSize(4);
+			Connection firstConnection = acquired.get(0).poolable();
+			for (PooledRef<Connection> ref : acquired) {
+				assertThat(ref.poolable()).isSameAs(firstConnection);
+			}
+
+			for (PooledRef<Connection> ref : acquired) {
+				ref.release().block(Duration.ofSeconds(1));
+			}
+		}
+		finally {
+			if (ch != null) {
+				ch.finishAndReleaseAll();
+				Connection.from(ch).dispose();
+			}
+		}
+	}
+
+	static final class TestChannelId implements ChannelId {
+
+		static final Random rndm = new Random();
+		final String id;
+
+		TestChannelId() {
+			byte[] array = new byte[8];
+			rndm.nextBytes(array);
+			this.id = new String(array, StandardCharsets.UTF_8);
+		}
+
+		@Override
+		public String asShortText() {
+			return id;
+		}
+
+		@Override
+		public String asLongText() {
+			return id;
+		}
+
+		@Override
+		public int compareTo(ChannelId o) {
+			if (this == o) {
+				return 0;
+			}
+			return this.asShortText().compareTo(o.asShortText());
+		}
+	}
+
+	static final class TestPoolMetricsRecorder implements PoolMetricsRecorder {
+
+		int pendingSuccessCounter;
+		int pendingErrorCounter;
+		long pendingSuccessLatency;
+		long pendingErrorLatency;
+
+		@Override
+		public void recordAllocationSuccessAndLatency(long latencyMs) {
+			//noop
+		}
+
+		@Override
+		public void recordAllocationFailureAndLatency(long latencyMs) {
+			//noop
+		}
+
+		@Override
+		public void recordResetLatency(long latencyMs) {
+			//noop
+		}
+
+		@Override
+		public void recordDestroyLatency(long latencyMs) {
+			//noop
+		}
+
+		@Override
+		public void recordRecycled() {
+			//noop
+		}
+
+		@Override
+		public void recordLifetimeDuration(long millisecondsSinceAllocation) {
+			//noop
+		}
+
+		@Override
+		public void recordIdleTime(long millisecondsIdle) {
+			//noop
+		}
+
+		@Override
+		public void recordSlowPath() {
+			//noop
+		}
+
+		@Override
+		public void recordFastPath() {
+			//noop
+		}
+
+		@Override
+		public void recordPendingSuccessAndLatency(long latencyMs) {
+			this.pendingSuccessCounter++;
+			this.pendingSuccessLatency = latencyMs;
+		}
+
+		@Override
+		public void recordPendingFailureAndLatency(long latencyMs) {
+			this.pendingErrorCounter++;
+			this.pendingErrorLatency = latencyMs;
+		}
+	}
+}

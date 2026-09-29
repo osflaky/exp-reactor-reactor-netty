@@ -1,0 +1,372 @@
+/*
+ * Copyright (c) 2020-2026 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package reactor.netty.http;
+
+import io.netty.handler.codec.http2.Http2CodecUtil;
+import io.netty.handler.codec.http2.Http2Settings;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+
+class Http2SettingsSpecTests {
+
+	private static final Long DEFAULT_MAX_CONCURRENT_STREAMS = Http2Settings.defaultSettings().maxConcurrentStreams();
+
+	private Http2SettingsSpec.Builder builder;
+
+	@BeforeEach
+	void setUp() {
+		builder = Http2SettingsSpec.builder();
+	}
+
+	@Test
+	public void connectProtocolEnabled() {
+		builder.connectProtocolEnabled(true);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isTrue();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void headerTableSize() {
+		builder.headerTableSize(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isEqualTo(123);
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void headerTableSizeBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.headerTableSize(-1))
+				.withMessageContaining("Setting HEADER_TABLE_SIZE is invalid: -1");
+	}
+
+	@Test
+	void initialWindowSize() {
+		builder.initialWindowSize(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isEqualTo(123);
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void initialWindowSizeBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.initialWindowSize(-1))
+				.withMessageContaining("Setting INITIAL_WINDOW_SIZE is invalid: -1");
+	}
+
+	@Test
+	void maxConcurrentStreams() {
+		builder.maxConcurrentStreams(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(123);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void maxConcurrentStreamsBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxConcurrentStreams(-1))
+				.withMessageContaining("Setting MAX_CONCURRENT_STREAMS is invalid: -1");
+	}
+
+	@Test
+	void maxDecodedRstFramesPerWindow() {
+		builder.maxDecodedRstFramesPerWindow(100, 10);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isEqualTo(100);
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isEqualTo(10);
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void maxDecodedRstFramesPerWindowBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxDecodedRstFramesPerWindow(-1, 10))
+				.withMessageContaining("maxDecodedRstFramesPerWindow must be positive or zero");
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxDecodedRstFramesPerWindow(10, -1))
+				.withMessageContaining("maxDecodedRstFramesSecondsPerWindow must be positive or zero");
+	}
+
+	@Test
+	void maxEncodedRstFramesPerWindow() {
+		builder.maxEncodedRstFramesPerWindow(100, 10);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isEqualTo(100);
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isEqualTo(10);
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void maxEncodedRstFramesPerWindowBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxEncodedRstFramesPerWindow(-1, 10))
+				.withMessageContaining("maxEncodedRstFramesPerWindow must be positive or zero");
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxEncodedRstFramesPerWindow(10, -1))
+				.withMessageContaining("maxEncodedRstFramesSecondsPerWindow must be positive or zero");
+	}
+
+	@Test
+	void maxFrameSize() {
+		builder.maxFrameSize(16384);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxFrameSize()).isEqualTo(16384);
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void maxFrameSizeBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxFrameSize(-1))
+				.withMessageContaining("Setting MAX_FRAME_SIZE is invalid: -1");
+	}
+
+	@Test
+	void maxHeaderListSize() {
+		builder.maxHeaderListSize(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(123);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	void maxHeaderListSizeBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxHeaderListSize(-1))
+				.withMessageContaining("Setting MAX_HEADER_LIST_SIZE is invalid: -1");
+	}
+
+	@Test
+	public void maxStreamsNoMaxConcurrentStreams() {
+		builder.maxStreams(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams())
+				.isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS != null ? DEFAULT_MAX_CONCURRENT_STREAMS : 123);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isEqualTo(123);
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	public void maxStreamsWithMaxConcurrentStreams_1() {
+		builder.maxStreams(123).maxConcurrentStreams(456);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(123);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isEqualTo(123);
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	public void maxStreamsWithMaxConcurrentStreams_2() {
+		builder.maxStreams(456).maxConcurrentStreams(123);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(123);
+		assertThat(spec.maxDecodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxDecodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesPerWindow()).isNull();
+		assertThat(spec.maxEncodedRstFramesSecondsPerWindow()).isNull();
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isEqualTo(456);
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	public void maxStreamsBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.maxStreams(-1))
+				.withMessageContaining("maxStreams must be positive");
+	}
+
+	@Test
+	void pingAckDropThreshold() {
+		builder.pingAckDropThreshold(1);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isNull();
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	public void pingAckDropThresholdBadValues() {
+		assertThatExceptionOfType(IllegalArgumentException.class)
+				.isThrownBy(() -> builder.pingAckDropThreshold(-1))
+				.withMessageContaining("pingAckDropThreshold must be positive");
+	}
+
+	@Test
+	void pingAckTimeout() {
+		builder.pingAckTimeout(Duration.ofMillis(100));
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.connectProtocolEnabled()).isNull();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.maxStreams()).isNull();
+		assertThat(spec.pingAckDropThreshold()).isEqualTo(1);
+		assertThat(spec.pingAckTimeout()).isEqualTo(Duration.ofMillis(100));
+		assertThat(spec.pushEnabled()).isNull();
+	}
+
+	@Test
+	public void pingAckTimeoutBadValues() {
+		assertThatExceptionOfType(NullPointerException.class)
+				.isThrownBy(() -> builder.pingAckTimeout(null));
+	}
+
+	/*
+	@Test
+	public void pushEnabled() {
+		builder.pushEnabled(true);
+		Http2SettingsSpec spec = builder.build();
+		assertThat(spec.headerTableSize()).isNull();
+		assertThat(spec.initialWindowSize()).isNull();
+		assertThat(spec.maxConcurrentStreams()).isEqualTo(DEFAULT_MAX_CONCURRENT_STREAMS);
+		assertThat(spec.maxFrameSize()).isNull();
+		assertThat(spec.maxHeaderListSize()).isEqualTo(Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE);
+		assertThat(spec.pushEnabled()).isTrue();
+	}
+	*/
+}

@@ -1,0 +1,1242 @@
+/*
+ * Copyright (c) 2011-2026 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package reactor.netty.http.client;
+
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.channels.ClosedChannelException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.unix.DomainSocketChannel;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpConstants;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpMessage;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponse;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
+import io.netty.handler.codec.http.cookie.ClientCookieEncoder;
+import io.netty.handler.codec.http.cookie.Cookie;
+import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
+import io.netty.handler.codec.http.multipart.HttpDataFactory;
+import io.netty.handler.codec.http.multipart.HttpPostRequestEncoder;
+import io.netty.handler.codec.http2.Http2StreamChannel;
+import io.netty.handler.stream.ChunkedWriteHandler;
+import io.netty.handler.timeout.ReadTimeoutHandler;
+import io.netty.util.ReferenceCountUtil;
+import org.jspecify.annotations.Nullable;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscription;
+import reactor.core.CoreSubscriber;
+import reactor.core.Disposable;
+import reactor.core.Exceptions;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.Operators;
+import reactor.core.publisher.Sinks;
+import reactor.netty.Connection;
+import reactor.netty.ConnectionObserver;
+import reactor.netty.FutureMono;
+import reactor.netty.NettyInbound;
+import reactor.netty.NettyOutbound;
+import reactor.netty.NettyPipeline;
+import reactor.netty.channel.AbortedException;
+import reactor.netty.channel.ChannelOperations;
+import reactor.netty.http.Cookies;
+import reactor.netty.http.HttpOperations;
+import reactor.netty.http.logging.HttpMessageArgProviderFactory;
+import reactor.netty.http.logging.HttpMessageLogFactory;
+import reactor.util.Logger;
+import reactor.util.Loggers;
+import reactor.util.context.ContextView;
+
+import static java.util.Objects.requireNonNull;
+import static reactor.netty.ReactorNetty.format;
+
+/**
+ * Conversion between Netty types and Reactor types ({@link HttpOperations}.
+ *
+ * @author Stephane Maldini
+ * @author Simon Baslé
+ * @author raccoonback
+ */
+class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
+		implements HttpClientResponse, HttpClientRequest {
+
+	final boolean                isSecure;
+	final HttpRequest            nettyRequest;
+	final HttpHeaders            requestHeaders;
+	final ClientCookieEncoder    cookieEncoder;
+	final ClientCookieDecoder    cookieDecoder;
+	final List<Cookie>           cookieList;
+	final Sinks.One<HttpHeaders> trailerHeaders;
+	final HttpVersion            version;
+
+	Supplier<String>[]           redirectedFrom = EMPTY_REDIRECTIONS;
+	int                          authenticationRetries;
+	int                          maxAuthenticationRetries;
+	@Nullable UriEndpoint        uriEndpoint;
+	@Nullable String             path;
+	@Nullable Duration           responseTimeout;
+
+	volatile @Nullable ResponseState responseState;
+
+	boolean started;
+	boolean retrying;
+	boolean is100Continue;
+	@Nullable RedirectClientException redirecting;
+	@Nullable HttpClientAuthenticationException authenticating;
+
+	@Nullable BiPredicate<HttpClientRequest, HttpClientResponse> followRedirectPredicate;
+	@Nullable BiPredicate<? super HttpClientRequest, ? super HttpClientResponse> authenticationPredicate;
+	@Nullable Consumer<HttpClientRequest> redirectRequestConsumer;
+	@Nullable HttpHeaders previousRequestHeaders;
+	@Nullable BiConsumer<HttpHeaders, HttpClientRequest> redirectRequestBiConsumer;
+	volatile @Nullable Throwable unprocessedOutboundError;
+
+	static final String INBOUND_CANCEL_LOG = "Http client inbound receiver cancelled, closing channel.";
+
+	HttpClientOperations(HttpClientOperations replaced) {
+		super(replaced);
+		this.started = replaced.started;
+		this.retrying = replaced.retrying;
+		this.redirecting = replaced.redirecting;
+		this.authenticating = replaced.authenticating;
+		this.redirectedFrom = replaced.redirectedFrom;
+		this.authenticationRetries = replaced.authenticationRetries;
+		this.maxAuthenticationRetries = replaced.maxAuthenticationRetries;
+		this.redirectRequestConsumer = replaced.redirectRequestConsumer;
+		this.previousRequestHeaders = replaced.previousRequestHeaders;
+		this.redirectRequestBiConsumer = replaced.redirectRequestBiConsumer;
+		this.isSecure = replaced.isSecure;
+		this.nettyRequest = replaced.nettyRequest;
+		this.responseState = replaced.responseState;
+		this.followRedirectPredicate = replaced.followRedirectPredicate;
+		this.authenticationPredicate = replaced.authenticationPredicate;
+		this.requestHeaders = replaced.requestHeaders;
+		this.cookieEncoder = replaced.cookieEncoder;
+		this.cookieDecoder = replaced.cookieDecoder;
+		this.cookieList = replaced.cookieList;
+		this.uriEndpoint = replaced.uriEndpoint;
+		this.path = replaced.path;
+		this.responseTimeout = replaced.responseTimeout;
+		this.is100Continue = replaced.is100Continue;
+		this.trailerHeaders = replaced.trailerHeaders;
+		this.version = replaced.version;
+		// No need to copy the unprocessedOutboundError field from the replaced instance. The reason for this is that the
+		// "unprocessedOutboundError" field contains an error that occurs when the connection of the HttpClientOperations
+		// is already closed. In essence, this error represents the final state for the HttpClientOperations, and there's
+		// no need to carry it over because it's considered as a terminal/concluding state.
+	}
+
+	HttpClientOperations(Connection c, ConnectionObserver listener, HttpClientOperations replaced) {
+		super(c, listener, replaced);
+		this.started = replaced.started;
+		this.retrying = replaced.retrying;
+		this.redirecting = replaced.redirecting;
+		this.authenticating = replaced.authenticating;
+		this.redirectedFrom = replaced.redirectedFrom;
+		this.authenticationRetries = replaced.authenticationRetries;
+		this.maxAuthenticationRetries = replaced.maxAuthenticationRetries;
+		this.redirectRequestConsumer = replaced.redirectRequestConsumer;
+		this.previousRequestHeaders = replaced.previousRequestHeaders;
+		this.redirectRequestBiConsumer = replaced.redirectRequestBiConsumer;
+		this.isSecure = replaced.isSecure;
+		this.nettyRequest = replaced.nettyRequest;
+		this.responseState = replaced.responseState;
+		this.followRedirectPredicate = replaced.followRedirectPredicate;
+		this.authenticationPredicate = replaced.authenticationPredicate;
+		this.requestHeaders = replaced.requestHeaders;
+		this.cookieEncoder = replaced.cookieEncoder;
+		this.cookieDecoder = replaced.cookieDecoder;
+		this.cookieList = replaced.cookieList;
+		this.uriEndpoint = replaced.uriEndpoint;
+		this.path = replaced.path;
+		this.responseTimeout = replaced.responseTimeout;
+		this.is100Continue = replaced.is100Continue;
+		this.trailerHeaders = replaced.trailerHeaders;
+		this.version = initHttpVersion(c);
+		// No need to copy the unprocessedOutboundError field from the replaced instance. The reason for this is that the
+		// "unprocessedOutboundError" field contains an error that occurs when the connection of the HttpClientOperations
+		// is already closed. In essence, this error represents the final state for the HttpClientOperations, and there's
+		// no need to carry it over because it's considered as a terminal/concluding state.
+	}
+
+	HttpClientOperations(Connection c, ConnectionObserver listener, ClientCookieEncoder encoder,
+			ClientCookieDecoder decoder, HttpMessageLogFactory httpMessageLogFactory) {
+		super(c, listener, httpMessageLogFactory);
+		this.isSecure = c.channel()
+		                 .pipeline()
+		                 .get(NettyPipeline.SslHandler) != null;
+		this.nettyRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
+		this.requestHeaders = nettyRequest.headers();
+		this.cookieDecoder = decoder;
+		this.cookieEncoder = encoder;
+		this.cookieList = new ArrayList<>();
+		this.version = initHttpVersion(c);
+		this.trailerHeaders = Sinks.unsafe().one();
+	}
+
+	private static HttpVersion initHttpVersion(Connection c) {
+		HttpVersion version;
+		if (c.channel() instanceof Http2StreamChannel) {
+			version = H2;
+		}
+		else if (c.channel() instanceof SocketChannel || c.channel() instanceof DomainSocketChannel) {
+			version = HttpVersion.HTTP_1_1;
+		}
+		else {
+			version = H3;
+		}
+		return version;
+	}
+
+	@Override
+	public HttpClientRequest addCookie(Cookie cookie) {
+		if (!hasSentHeaders()) {
+			this.cookieEncoder.encode(cookie);
+			this.cookieList.add(cookie);
+		}
+		else {
+			throw new IllegalStateException("Status and headers already sent");
+		}
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations addHandlerLast(ChannelHandler handler) {
+		super.addHandlerLast(handler);
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations addHandlerLast(String name, ChannelHandler handler) {
+		super.addHandlerLast(name, handler);
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations addHandlerFirst(ChannelHandler handler) {
+		super.addHandlerFirst(handler);
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations addHandlerFirst(String name, ChannelHandler handler) {
+		super.addHandlerFirst(name, handler);
+		return this;
+	}
+
+	@Override
+	@SuppressWarnings("deprecation")
+	public HttpClientOperations addHandler(ChannelHandler handler) {
+		super.addHandler(handler);
+		return this;
+	}
+
+	@Override
+	@SuppressWarnings("FutureReturnValueIgnored")
+	public HttpClientOperations addHandler(String name, ChannelHandler handler) {
+		// Returned value is deliberately ignored
+		super.addHandler(name, handler);
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations replaceHandler(String name, ChannelHandler handler) {
+		super.replaceHandler(name, handler);
+		return this;
+	}
+
+	@Override
+	public HttpClientOperations removeHandler(String name) {
+		super.removeHandler(name);
+		return this;
+	}
+
+	@Override
+	public HttpClientRequest addHeader(CharSequence name, CharSequence value) {
+		if (!hasSentHeaders()) {
+			this.requestHeaders.add(name, value);
+		}
+		else {
+			throw new IllegalStateException("Status and headers already sent");
+		}
+		return this;
+	}
+
+	@Override
+	public InetSocketAddress address() {
+		return (InetSocketAddress) channel().remoteAddress();
+	}
+
+	public void chunkedTransfer(boolean chunked) {
+		if (!hasSentHeaders() && HttpUtil.isTransferEncodingChunked(nettyRequest) != chunked) {
+			requestHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
+			HttpUtil.setTransferEncodingChunked(nettyRequest, chunked);
+		}
+	}
+
+	@Override
+	public HttpClientOperations withConnection(Consumer<? super Connection> withConnection) {
+		Objects.requireNonNull(withConnection, "withConnection");
+		withConnection.accept(this);
+		return this;
+	}
+
+	@Override
+	public Map<CharSequence, Set<Cookie>> cookies() {
+		ResponseState responseState = this.responseState;
+		if (responseState != null && responseState.cookieHolder != null) {
+			return responseState.cookieHolder.getCachedCookies();
+		}
+		return Collections.emptyMap();
+	}
+
+	void followRedirectPredicate(@Nullable BiPredicate<HttpClientRequest, HttpClientResponse> predicate) {
+		this.followRedirectPredicate = predicate;
+	}
+
+	void authenticationPredicate(@Nullable BiPredicate<? super HttpClientRequest, ? super HttpClientResponse> predicate) {
+		this.authenticationPredicate = predicate;
+	}
+
+	void configureAuthenticationRetries(int authenticationRetries, int maxAuthenticationRetries) {
+		this.authenticationRetries = authenticationRetries;
+		this.maxAuthenticationRetries = maxAuthenticationRetries;
+	}
+
+	void redirectRequestConsumer(@Nullable Consumer<HttpClientRequest> redirectRequestConsumer) {
+		this.redirectRequestConsumer = redirectRequestConsumer;
+	}
+
+	@Override
+	@SuppressWarnings("FutureReturnValueIgnored")
+	protected void onInboundCancel() {
+		if (isInboundDisposed()) {
+			return;
+		}
+		//"FutureReturnValueIgnored" this is deliberate
+		if (log.isDebugEnabled()) {
+			log.debug(format(channel(), INBOUND_CANCEL_LOG));
+		}
+		// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+		// Whether there are subscribers or the subscriber cancels is not of interest
+		// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+		// FAIL_ZERO_SUBSCRIBER
+		trailerHeaders.tryEmitEmpty();
+		channel().close();
+	}
+
+	@Override
+	protected final void onUnprocessedOutboundError(Throwable t) {
+		this.unprocessedOutboundError = t;
+	}
+
+	@Override
+	protected void onInboundClose() {
+		if (isInboundCancelled() || isInboundDisposed()) {
+			listener().onStateChange(this, ConnectionObserver.State.DISCONNECTING);
+			return;
+		}
+		// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+		// Whether there are subscribers or the subscriber cancels is not of interest
+		// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+		// FAIL_ZERO_SUBSCRIBER
+		trailerHeaders.tryEmitEmpty();
+		listener().onStateChange(this, HttpClientState.RESPONSE_INCOMPLETE);
+		if (responseState == null) {
+			Throwable exception;
+			if (markSentHeaderAndBody()) {
+				exception = AbortedException.beforeSend();
+			}
+			else if (markSentBody()) {
+				exception = new PrematureCloseException("Connection has been closed BEFORE response, while sending request body");
+			}
+			else {
+				exception = new PrematureCloseException("Connection prematurely closed BEFORE response");
+			}
+			listener().onUncaughtException(this, addOutboundErrorCause(exception, unprocessedOutboundError));
+			return;
+		}
+		super.onInboundError(addOutboundErrorCause(new PrematureCloseException("Connection prematurely closed DURING response"),
+				unprocessedOutboundError));
+	}
+
+	@Override
+	protected void afterInboundComplete() {
+		if (redirecting != null) {
+			listener().onUncaughtException(this, redirecting);
+		}
+		else if (authenticating != null) {
+			listener().onUncaughtException(this, authenticating);
+		}
+		else {
+			listener().onStateChange(this, HttpClientState.RESPONSE_COMPLETED);
+		}
+	}
+
+	@Override
+	public HttpClientRequest header(CharSequence name, CharSequence value) {
+		if (!hasSentHeaders()) {
+			this.requestHeaders.set(name, value);
+		}
+		else {
+			throw new IllegalStateException("Status and headers already sent");
+		}
+		return this;
+	}
+
+	@Override
+	public HttpClientRequest headers(HttpHeaders headers) {
+		if (!hasSentHeaders()) {
+			String host = requestHeaders.get(HttpHeaderNames.HOST);
+			this.requestHeaders.set(headers);
+			this.requestHeaders.set(HttpHeaderNames.HOST, host);
+		}
+		else {
+			throw new IllegalStateException("Status and headers already sent");
+		}
+		return this;
+	}
+
+	@Override
+	public boolean isFollowRedirect() {
+		return followRedirectPredicate != null && redirectedFrom.length <= MAX_REDIRECTS;
+	}
+
+	@Override
+	public HttpClientRequest responseTimeout(Duration maxReadOperationInterval) {
+		if (!hasSentHeaders()) {
+			this.responseTimeout = maxReadOperationInterval;
+		}
+		else {
+			throw new IllegalStateException("Status and headers already sent");
+		}
+		return this;
+	}
+
+	@Override
+	public boolean isKeepAlive() {
+		ResponseState rs = responseState;
+		if (rs != null) {
+			return HttpUtil.isKeepAlive(rs.response);
+		}
+		return HttpUtil.isKeepAlive(nettyRequest);
+	}
+
+	@Override
+	public boolean isWebsocket() {
+		ChannelOperations<?, ?> ops = get(channel());
+		return ops != null &&
+				(ops.getClass().equals(WebsocketClientOperations.class) ||
+				ops.getClass().equals(Http2WebsocketClientOperations.class));
+	}
+
+	@Override
+	public HttpMethod method() {
+		return nettyRequest.method();
+	}
+
+	@Override
+	public final HttpClientOperations onDispose(Disposable onDispose) {
+		super.onDispose(onDispose);
+		return this;
+	}
+
+	@Override
+	public ContextView currentContextView() {
+		return currentContext();
+	}
+
+	@Override
+	public String[] redirectedFrom() {
+		Supplier<String>[] redirectedFrom = this.redirectedFrom;
+		String[] dest = new String[redirectedFrom.length];
+		for (int i = 0; i < redirectedFrom.length; i++) {
+			dest[i] = redirectedFrom[i].get();
+		}
+		return dest;
+	}
+
+	@Override
+	public int authenticationRetryCount() {
+		return authenticationRetries;
+	}
+
+	@Override
+	public HttpHeaders requestHeaders() {
+		return nettyRequest.headers();
+	}
+
+	@Override
+	public HttpHeaders responseHeaders() {
+		ResponseState responseState = this.responseState;
+		if (responseState != null) {
+			return responseState.headers;
+		}
+		throw new IllegalStateException("Response headers cannot be accessed without " + "server response");
+	}
+
+	@Override
+	public NettyOutbound send(Publisher<? extends ByteBuf> source) {
+		if (!channel().isActive()) {
+			return then(Mono.error(AbortedException.beforeSend()));
+		}
+		if (source instanceof Mono) {
+			return super.send(source);
+		}
+		if (Objects.equals(method(), HttpMethod.GET) ||
+				Objects.equals(method(), HttpMethod.HEAD) ||
+				Objects.equals(method(), HttpMethod.DELETE)) {
+
+			ByteBufAllocator alloc = channel().alloc();
+			return new PostHeadersNettyOutbound(Flux.from(source)
+			                .switchOnFirst((signal, flux) -> {
+			                    if (signal.isOnComplete()) {
+			                        return markSentHeaderAndBody() ?
+			                                FutureMono.from(channel().writeAndFlush(newFullBodyMessage())) :
+			                                Mono.empty();
+			                    }
+			                    return flux.collect(alloc::compositeBuffer, (prev, next) -> prev.addComponent(true, next))
+			                               .doOnDiscard(ByteBuf.class, ByteBuf::release)
+			                               .flatMap(output -> {
+			                                   if (markSentHeaderAndBody(output)) {
+			                                       if (output.readableBytes() > 0) {
+			                                           return FutureMono.from(channel().writeAndFlush(newFullBodyMessage(output)));
+			                                       }
+			                                       output.release();
+			                                       return FutureMono.from(channel().writeAndFlush(newFullBodyMessage()));
+			                                   }
+			                                   if (log.isDebugEnabled()) {
+			                                       log.debug(format(channel(), "Ignoring accumulated bytebuf on http {} {}"), method(), output);
+			                                   }
+			                                   output.release();
+			                                   return Mono.empty();
+			                               });
+			                }, false).then(), this, null);
+		}
+
+		return super.send(source);
+	}
+
+	@Override
+	public <S> NettyOutbound sendUsing(Callable<? extends S> sourceInput,
+			BiFunction<? super Connection, ? super S, ?> mappedInput,
+			Consumer<? super S> sourceCleanup) {
+		requireNonNull(sourceInput, "sourceInput");
+		requireNonNull(mappedInput, "mappedInput");
+		requireNonNull(sourceCleanup, "sourceCleanup");
+
+		return then(Mono.using(
+				sourceInput,
+				s -> {
+					if (!hasSentBody()) {
+						return FutureMono.from(channel().writeAndFlush(mappedInput.apply(this, s)));
+					}
+					else {
+						if (log.isDebugEnabled()) {
+							log.debug(format(channel(), "Dropped HTTP content, since request has been sent already."));
+						}
+						return Mono.empty();
+					}
+				},
+				sourceCleanup)
+		);
+	}
+
+	final URI websocketUri() {
+		URI uri;
+		try {
+			String url = uri();
+			if (url.startsWith(HttpClient.HTTP_SCHEME) || url.startsWith(HttpClient.WS_SCHEME)) {
+				uri = new URI(url);
+			}
+			else {
+				String host = requestHeaders().get(HttpHeaderNames.HOST);
+				uri = new URI((isSecure ? HttpClient.WSS_SCHEME :
+				                          HttpClient.WS_SCHEME) + "://" + host + (url.startsWith("/") ? url : "/" + url));
+			}
+		}
+		catch (URISyntaxException e) {
+			throw new IllegalArgumentException(e);
+		}
+		return uri;
+	}
+
+	@Override
+	public HttpResponseStatus status() {
+		ResponseState responseState = this.responseState;
+		if (responseState != null) {
+			return responseState.response.status();
+		}
+		throw new IllegalStateException("Trying to access status() while missing response");
+	}
+
+	@Override
+	public Mono<HttpHeaders> trailerHeaders() {
+		return trailerHeaders.asMono();
+	}
+
+	@Override
+	public final String uri() {
+		return this.nettyRequest.uri();
+	}
+
+	@Override
+	public final String fullPath() {
+		if (uriEndpoint != null) {
+			String p = uriEndpoint.getPath();
+			if (p != null) {
+				return p;
+			}
+		}
+		if (path == null) {
+			path = resolvePath(uri());
+		}
+		return path;
+	}
+
+	@Override
+	public @Nullable String resourceUrl() {
+		return uriEndpoint != null ? uriEndpoint.toExternalForm() : null;
+	}
+
+	@Override
+	public final HttpVersion version() {
+		return version;
+	}
+
+	/**
+	 * React on channel unwritability event while the http client request is being written.
+	 *
+	 * <p>When using plain HTTP/1.1 and {@code HttpClient.send(Mono<ByteBuf>)}, if the socket becomes unwritable while writing,
+	 * we need to request for reads. This is necessary to read any early server response, such as a 400 bad request followed
+	 * by a socket close, while the request is still being written. Else, a "premature close exception before response" may be reported
+	 * to the user, causing confusion about the server's early response.
+	 *
+	 * <p>There is no need to request for reading in other cases
+	 * (H2/H2C/H1S/WebSocket), because in these cases the read interest has already been requested, or auto-read is enabled
+	 *
+	 * <p>Important notes:
+	 * <p>
+	 * - If the connection is unwritable and {@code send(Flux<ByteBuf>)} has been used, then {@code hasSentBody()} will
+	 * always return false, because when {@code send(Flux<ByteBuf>)} is used, {@code hasSentBody()} can only return true
+	 * if the request is fully written (see {@link #onOutboundComplete()} method which invokes {@code markSentBody()}
+	 * and sets the state to BODY_SENT).
+	 * So if channel is unwritable and {@code hasSentBody()} returns true, it means that {@code send(Mono<ByteBuf>)} has
+	 * been used (see {@link HttpOperations#send(Publisher)} where {@code markSentHeaderAndBody(b)} is setting
+	 * the state to BODY_SENT when the Publisher is a Mono).
+	 *
+	 * <p>- When the channel is unwritable, a channel read() has already been requested or is in auto-read if:
+	 * <ul><li> Secure mode is used (Netty SslHandler requests read() when flushing).</li>
+	 * <li>HTTP2 is used.</li>
+	 * <li>WebSocket is used.</li>
+	 * </ul>
+	 *
+	 * <p>See GH-2825 for more info
+	 */
+	@Override
+	protected void onWritabilityChanged() {
+		if (!isSecure &&
+				!channel().isWritable() && !channel().config().isAutoRead() &&
+				hasSentBody() &&
+				!(channel() instanceof Http2StreamChannel) &&
+				!isWebsocket()) {
+			channel().read();
+		}
+	}
+
+	@Override
+	protected void afterMarkSentHeaders() {
+		//Noop
+	}
+
+	@Override
+	protected void beforeMarkSentHeaders() {
+		if (redirectedFrom.length > 0) {
+			if (redirectRequestConsumer != null) {
+				redirectRequestConsumer.accept(this);
+			}
+			if (redirectRequestBiConsumer != null && previousRequestHeaders != null) {
+				redirectRequestBiConsumer.accept(previousRequestHeaders, this);
+				previousRequestHeaders = null;
+			}
+		}
+
+		if (!cookieList.isEmpty()) {
+			requestHeaders.add(HttpHeaderNames.COOKIE, cookieEncoder.encode(cookieList));
+		}
+	}
+
+	@Override
+	protected boolean isContentAlwaysEmpty() {
+		return false;
+	}
+
+	@Override
+	protected void onHeadersSent() {
+		channel().read();
+		if (channel().parent() != null) {
+			channel().parent().read();
+		}
+	}
+
+	@Override
+	@SuppressWarnings("FutureReturnValueIgnored")
+	protected void onOutboundComplete() {
+		if (isWebsocket() || isInboundCancelled()) {
+			return;
+		}
+		if (markSentHeaderAndBody()) {
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "No sendHeaders() called before complete, sending " +
+						"zero-length header"));
+			}
+			//"FutureReturnValueIgnored" this is deliberate
+			HttpMessage msg = Objects.equals(method(), HttpMethod.GET) ||
+					Objects.equals(method(), HttpMethod.HEAD) ||
+					Objects.equals(method(), HttpMethod.DELETE) ?
+					newFullBodyMessage() : newFullBodyMessage(Unpooled.EMPTY_BUFFER);
+			channel().writeAndFlush(msg);
+		}
+		else if (markSentBody()) {
+			//"FutureReturnValueIgnored" this is deliberate
+			channel().writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+		}
+		listener().onStateChange(this, HttpClientState.REQUEST_SENT);
+		ChannelPipeline pipeline = channel().pipeline();
+		if (responseTimeout != null && pipeline.get(NettyPipeline.ResponseTimeoutHandler) == null) {
+			// This handler has to be always as early as possible in order to handle correctly the time for receiving the read/readComplete events.
+			// We don't want other handlers to delay read/readComplete events delivery.
+			String baseName = null;
+			if (pipeline.get(NettyPipeline.HttpCodec) != null) {
+				baseName = NettyPipeline.HttpCodec;
+			}
+			else if (pipeline.get(NettyPipeline.H2ToHttp11Codec) != null) {
+					baseName = NettyPipeline.H2ToHttp11Codec;
+			}
+			else if (pipeline.get(NettyPipeline.H3ToHttp11Codec) != null) {
+				baseName = NettyPipeline.H3ToHttp11Codec;
+			}
+			else {
+				ChannelHandler httpClientCodec = pipeline.get(HttpClientCodec.class);
+				if (httpClientCodec != null) {
+					baseName = pipeline.context(httpClientCodec).name();
+				}
+			}
+			pipeline.addBefore(baseName, NettyPipeline.ResponseTimeoutHandler,
+					new ReadTimeoutHandler(responseTimeout.toMillis(), TimeUnit.MILLISECONDS));
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Added encoder [{}] at the beginning of the user pipeline, full pipeline: {}"),
+						NettyPipeline.ResponseTimeoutHandler,
+						pipeline.names());
+			}
+			if (isPersistent()) {
+				onTerminate().subscribe(null, null, () -> removeHandler(NettyPipeline.ResponseTimeoutHandler));
+			}
+		}
+		channel().read();
+		if (channel().parent() != null) {
+			channel().parent().read();
+		}
+	}
+
+	@Override
+	protected void onOutboundError(Throwable err) {
+		if (isPersistent() && responseState == null) {
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Outbound error happened"), err);
+			}
+			listener().onUncaughtException(this, err);
+			//force auto read to enable more accurate close selection now inbound is done
+			channel().config().setAutoRead(true);
+			if (markSentBody()) {
+				markPersistent(false);
+			}
+			terminate();
+			return;
+		}
+		super.onOutboundError(err);
+	}
+
+	@Override
+	protected void onInboundNext(ChannelHandlerContext ctx, Object msg) {
+		if (msg instanceof HttpResponse) {
+			HttpResponse response = (HttpResponse) msg;
+			if (response.decoderResult().isFailure()) {
+				onInboundError(response.decoderResult().cause());
+				ReferenceCountUtil.release(msg);
+				// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+				// Whether there are subscribers or the subscriber cancels is not of interest
+				// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+				// FAIL_ZERO_SUBSCRIBER
+				trailerHeaders.tryEmitEmpty();
+				//force auto read to enable more accurate close selection now inbound is done
+				channel().config().setAutoRead(true);
+				terminate();
+				return;
+			}
+			if (HttpResponseStatus.CONTINUE.equals(response.status())) {
+				is100Continue = true;
+				ReferenceCountUtil.release(msg);
+				return;
+			}
+			if (started) {
+				if (log.isDebugEnabled()) {
+					log.debug(format(channel(), "HttpClientOperations cannot proceed more than one response {}"),
+							httpMessageLogFactory().debug(HttpMessageArgProviderFactory.create(response, version)));
+				}
+				ReferenceCountUtil.release(msg);
+				return;
+			}
+			is100Continue = false;
+			started = true;
+			setNettyResponse(response);
+
+			if (!isKeepAlive()) {
+				markPersistent(false);
+			}
+			if (isInboundCancelled()) {
+				ReferenceCountUtil.release(msg);
+				return;
+			}
+
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Received response (auto-read:{}) : {}"),
+						channel().config().isAutoRead(),
+						httpMessageLogFactory().debug(HttpMessageArgProviderFactory.create(response, version)));
+			}
+
+			if (notRedirected(response) && authenticationNotRequired()) {
+				try {
+					listener().onStateChange(this, HttpClientState.RESPONSE_RECEIVED);
+				}
+				catch (Exception e) {
+					onInboundError(e);
+					ReferenceCountUtil.release(msg);
+					return;
+				}
+			}
+			else {
+				// when redirecting or authenticating no need of manual reading
+				channel().config().setAutoRead(true);
+			}
+
+			if (msg instanceof FullHttpResponse) {
+				FullHttpResponse request = (FullHttpResponse) msg;
+				if (request.content().readableBytes() > 0) {
+					super.onInboundNext(ctx, msg);
+				}
+				else {
+					request.release();
+				}
+				// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+				// Whether there are subscribers or the subscriber cancels is not of interest
+				// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+				// FAIL_ZERO_SUBSCRIBER
+				trailerHeaders.tryEmitValue(request.trailingHeaders());
+				//force auto read to enable more accurate close selection now inbound is done
+				channel().config().setAutoRead(true);
+				terminate();
+			}
+			return;
+		}
+
+		if (msg instanceof LastHttpContent) {
+			LastHttpContent lastHttpContent = (LastHttpContent) msg;
+			if (lastHttpContent.decoderResult().isFailure()) {
+				onInboundError(lastHttpContent.decoderResult().cause());
+				lastHttpContent.release();
+				// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+				// Whether there are subscribers or the subscriber cancels is not of interest
+				// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+				// FAIL_ZERO_SUBSCRIBER
+				trailerHeaders.tryEmitValue(lastHttpContent.trailingHeaders());
+				//force auto read to enable more accurate close selection now inbound is done
+				channel().config().setAutoRead(true);
+				terminate();
+				return;
+			}
+
+			if (is100Continue) {
+				lastHttpContent.release();
+				channel().read();
+				return;
+			}
+			if (!started) {
+				if (log.isDebugEnabled()) {
+					log.debug(format(channel(), "HttpClientOperations received an incorrect end " +
+							"delimiter (previously used connection?)"));
+				}
+				lastHttpContent.release();
+				return;
+			}
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Received last HTTP packet"));
+			}
+			if (lastHttpContent != LastHttpContent.EMPTY_LAST_CONTENT) {
+				// When there is HTTP/2 response with INBOUND HEADERS(endStream=false) followed by INBOUND DATA(endStream=true length=0),
+				// Netty sends LastHttpContent with empty buffer instead of EMPTY_LAST_CONTENT
+				if (redirecting != null || authenticating != null || lastHttpContent.content().readableBytes() == 0) {
+					lastHttpContent.release();
+				}
+				else {
+					super.onInboundNext(ctx, lastHttpContent);
+				}
+			}
+
+			if (redirecting == null && authenticating == null) {
+				// EmitResult is ignored as it is guaranteed that there will be only one emission of LastHttpContent
+				// Whether there are subscribers or the subscriber cancels is not of interest
+				// Evaluated EmitResult: FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_CANCELLED, FAIL_NON_SERIALIZED
+				// FAIL_ZERO_SUBSCRIBER
+				trailerHeaders.tryEmitValue(lastHttpContent.trailingHeaders());
+			}
+
+			//force auto read to enable more accurate close selection now inbound is done
+			channel().config().setAutoRead(true);
+			if (markSentBody()) {
+				markPersistent(false);
+			}
+			terminate();
+			return;
+		}
+
+		if (!started) {
+			if (log.isDebugEnabled()) {
+				if (msg instanceof ByteBufHolder) {
+					msg = ((ByteBufHolder) msg).content();
+				}
+				log.debug(format(channel(), "HttpClientOperations received an incorrect chunk {} " +
+								"(previously used connection?)"),
+						msg);
+			}
+			ReferenceCountUtil.release(msg);
+			return;
+		}
+
+		if (redirecting != null || authenticating != null) {
+			ReferenceCountUtil.release(msg);
+			// when redirecting or authenticating auto-read is set to true, no need of manual reading
+			return;
+		}
+		super.onInboundNext(ctx, msg);
+	}
+
+	@Override
+	protected HttpMessage outboundHttpMessage() {
+		return nettyRequest;
+	}
+
+	@SuppressWarnings("NullAway")
+	final boolean notRedirected(HttpResponse response) {
+		// Deliberately suppress "NullAway"
+		// followRedirectPredicate is checked for null in isFollowRedirect()
+		if (isFollowRedirect() && followRedirectPredicate.test(this, this)) {
+			try {
+				redirecting = new RedirectClientException(response.headers(), response.status());
+			}
+			catch (RuntimeException e) {
+				if (log.isDebugEnabled()) {
+					log.debug(format(channel(), "The request cannot be redirected"), e);
+				}
+				return true;
+			}
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Received redirect location: {}"),
+						httpMessageLogFactory().debug(HttpMessageArgProviderFactory.create(response, version)));
+			}
+			return false;
+		}
+		return true;
+	}
+
+	final boolean authenticationNotRequired() {
+		if (authenticationPredicate != null && authenticationRetries < maxAuthenticationRetries &&
+				authenticationPredicate.test(this, this)) {
+			authenticating = new HttpClientAuthenticationException();
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Authentication predicate matched, triggering retry (attempt {} of {})"),
+						authenticationRetries + 1, maxAuthenticationRetries);
+			}
+			return false;
+		}
+		return true;
+	}
+
+	@Override
+	protected HttpMessage newFullBodyMessage(ByteBuf body) {
+		HttpRequest request = new DefaultFullHttpRequest(version(), method(), uri(), body);
+
+		requestHeaders.setInt(HttpHeaderNames.CONTENT_LENGTH, body.readableBytes());
+		requestHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
+
+		request.headers()
+		       .set(requestHeaders);
+		return request;
+	}
+
+	HttpMessage newFullBodyMessage() {
+		HttpRequest request = new DefaultFullHttpRequest(version(), method(), uri(), Unpooled.EMPTY_BUFFER);
+
+		requestHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
+
+		request.headers().set(requestHeaders);
+		return request;
+	}
+
+	@Override
+	protected Throwable wrapInboundError(Throwable err) {
+		if (err instanceof ClosedChannelException) {
+			return new PrematureCloseException(err);
+		}
+		return super.wrapInboundError(err);
+	}
+
+	final HttpRequest getNettyRequest() {
+		return nettyRequest;
+	}
+
+	final Mono<Void> send() {
+		if (!channel().isActive()) {
+			return Mono.error(AbortedException.beforeSend());
+		}
+		return FutureMono.deferFuture(() -> {
+			if (markSentHeaderAndBody()) {
+				HttpMessage msg = Objects.equals(method(), HttpMethod.GET) ||
+						Objects.equals(method(), HttpMethod.HEAD) ||
+						Objects.equals(method(), HttpMethod.DELETE) ?
+						newFullBodyMessage() : newFullBodyMessage(Unpooled.EMPTY_BUFFER);
+				return channel().writeAndFlush(msg);
+			}
+			else {
+				return channel().newSucceededFuture();
+			}
+		});
+	}
+
+	final void setNettyResponse(HttpResponse nettyResponse) {
+		ResponseState state = responseState;
+		if (state == null) {
+			this.responseState =
+					new ResponseState(nettyResponse, nettyResponse.headers(), cookieDecoder);
+		}
+	}
+
+	@SuppressWarnings("ReferenceEquality")
+	final void withWebsocketSupport(WebsocketClientSpec websocketClientSpec) {
+		URI url = websocketUri();
+		//prevent further header to be sent for handshaking
+		if (markSentHeaders()) {
+			if (log.isDebugEnabled()) {
+				log.debug(format(channel(), "Attempting to perform websocket handshake with {}"), url);
+			}
+			WebsocketClientOperations ops;
+			// ReferenceEquality is deliberate
+			if (version == H2) {
+				ops = new Http2WebsocketClientOperations(url, websocketClientSpec, this);
+			}
+			else {
+				ops = new WebsocketClientOperations(url, websocketClientSpec, this);
+			}
+
+			if (!rebind(ops)) {
+				log.error(format(channel(), "Error while rebinding websocket in channel attribute: " +
+						get(channel()) + " to " + ops));
+			}
+		}
+	}
+
+	static Throwable addOutboundErrorCause(Throwable exception, @Nullable Throwable cause) {
+		if (cause != null) {
+			cause.setStackTrace(new StackTraceElement[0]);
+			exception.initCause(cause);
+		}
+		return exception;
+	}
+
+	static final class ResponseState {
+
+		final HttpResponse response;
+		final HttpHeaders  headers;
+		final Cookies      cookieHolder;
+
+		ResponseState(HttpResponse response, HttpHeaders headers, ClientCookieDecoder decoder) {
+			this.response = response;
+			this.headers = headers;
+			this.cookieHolder = Cookies.newClientResponseHolder(headers, decoder);
+		}
+	}
+
+	static final class SendForm extends Mono<Void> {
+
+		static final HttpDataFactory DEFAULT_FACTORY = new DefaultHttpDataFactory(DefaultHttpDataFactory.MINSIZE);
+
+		final HttpClientOperations                                  parent;
+		final BiConsumer<? super HttpClientRequest, HttpClientForm> formCallback;
+		final @Nullable Consumer<Flux<Long>>                        progressCallback;
+
+		SendForm(HttpClientOperations parent,
+				BiConsumer<? super HttpClientRequest, HttpClientForm>  formCallback,
+				@Nullable Consumer<Flux<Long>> progressCallback) {
+			this.parent = parent;
+			this.formCallback = formCallback;
+			this.progressCallback = progressCallback;
+		}
+
+		@Override
+		public void subscribe(CoreSubscriber<? super Void> s) {
+			if (!parent.markSentHeaders()) {
+				Operators.error(s,
+						new IllegalStateException("headers have already been sent"));
+				return;
+			}
+			Subscription subscription = Operators.emptySubscription();
+			s.onSubscribe(subscription);
+			if (parent.channel()
+			          .eventLoop()
+			          .inEventLoop()) {
+				_subscribe(s);
+			}
+			else {
+				parent.channel()
+				      .eventLoop()
+				      .execute(() -> _subscribe(s));
+			}
+		}
+
+		@SuppressWarnings("FutureReturnValueIgnored")
+		void _subscribe(CoreSubscriber<? super Void> s) {
+			HttpDataFactory df = DEFAULT_FACTORY;
+
+			try {
+				HttpClientFormEncoder encoder = new HttpClientFormEncoder(df,
+						parent.nettyRequest,
+						false,
+						HttpConstants.DEFAULT_CHARSET,
+						HttpPostRequestEncoder.EncoderMode.RFC1738);
+
+				formCallback.accept(parent, encoder);
+
+				encoder = encoder.applyChanges(parent.nettyRequest);
+				df = encoder.newFactory;
+
+				if (!encoder.isMultipart()) {
+					parent.requestHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
+				}
+
+				// Returned value is deliberately ignored
+				parent.addHandlerFirst(NettyPipeline.ChunkedWriter, new ChunkedWriteHandler());
+
+				boolean chunked = HttpUtil.isTransferEncodingChunked(parent.nettyRequest);
+
+				HttpRequest r = encoder.finalizeRequest();
+
+				if (!chunked) {
+					HttpUtil.setTransferEncodingChunked(r, false);
+					HttpUtil.setContentLength(r, encoder.length());
+				}
+
+				ChannelFuture f = parent.channel()
+				                        .writeAndFlush(r);
+
+				if (encoder.isChunked()) {
+					Flux<Long> tail = encoder.progressSink.asFlux().onBackpressureLatest();
+
+					if (encoder.cleanOnTerminate) {
+						tail = tail.doOnCancel(encoder)
+						           .doAfterTerminate(encoder);
+					}
+
+					if (progressCallback != null) {
+						progressCallback.accept(tail);
+					}
+					else {
+						tail.subscribe();
+					}
+					//"FutureReturnValueIgnored" this is deliberate
+					parent.channel()
+					      .writeAndFlush(encoder);
+				}
+				else {
+					Mono<Void> mono = FutureMono.from(f);
+
+					if (encoder.cleanOnTerminate) {
+						mono = mono.doOnCancel(encoder)
+						           .doAfterTerminate(encoder);
+					}
+
+					if (progressCallback != null) {
+						progressCallback.accept(mono.cast(Long.class)
+						                            .switchIfEmpty(Mono.just(encoder.length()))
+						                            .flux());
+					}
+					else {
+						mono.subscribe();
+					}
+				}
+				s.onComplete();
+
+
+			}
+			catch (Throwable e) {
+				Exceptions.throwIfJvmFatal(e);
+				df.cleanRequestHttpData(parent.nettyRequest);
+				s.onError(Exceptions.unwrap(e));
+			}
+		}
+	}
+
+	static final HttpVersion            H2 = HttpVersion.valueOf("HTTP/2.0");
+	static final HttpVersion            H3 = HttpVersion.valueOf("HTTP/3.0");
+	static final int                    MAX_REDIRECTS      = 50;
+	@SuppressWarnings({"unchecked", "rawtypes"})
+	static final Supplier<String>[]     EMPTY_REDIRECTIONS = (Supplier<String>[]) new Supplier[0];
+	static final Logger                 log                = Loggers.getLogger(HttpClientOperations.class);
+}

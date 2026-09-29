@@ -1,0 +1,394 @@
+[
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.AbstractHttpClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.AbstractHttpClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.AbstractWebSocketClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.AbstractWebSocketClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.ContextAwareHttpClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.ContextAwareHttpClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.ContextAwareWebSocketClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.ContextAwareWebSocketClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http2StreamBridgeClientHandler"
+		},
+		"name": "reactor.netty.http.client.Http2StreamBridgeClientHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientHandshaker$HandshakeRequestEncoder"
+		},
+		"name": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientHandshaker$HandshakeRequestEncoder",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientHandshaker$WebsocketStreamBridgeClientHandler"
+		},
+		"name": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientHandshaker$WebsocketStreamBridgeClientHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientExtensionHandler"
+		},
+		"name": "reactor.netty.http.client.Http2WebsocketClientOperations$WebsocketClientExtensionHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3ChannelInitializer"
+		},
+		"name": "reactor.netty.http.client.Http3ChannelInitializer",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3ChannelInitializer$HttpTrafficHandler"
+		},
+		"name": "reactor.netty.http.client.Http3ChannelInitializer$HttpTrafficHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3ConnectionProvider$PooledConnectionAllocator$Http3ConnectionInitializer"
+		},
+		"name": "reactor.netty.http.client.Http3ConnectionProvider$PooledConnectionAllocator$Http3ConnectionInitializer",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3ConnectionProvider$PooledConnectionAllocator$Http3MaxStreamsHandler"
+		},
+		"name": "reactor.netty.http.client.Http3ConnectionProvider$PooledConnectionAllocator$Http3MaxStreamsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3Codec"
+		},
+		"name": "reactor.netty.http.client.Http3Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.Http3StreamBridgeClientHandler"
+		},
+		"name": "reactor.netty.http.client.Http3StreamBridgeClientHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$H2CleartextCodec"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$H2CleartextCodec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$H2Codec"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$H2Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$H2InboundStreamHandler"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$H2InboundStreamHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$H2MaxConcurrentStreamsHandler"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$H2MaxConcurrentStreamsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$H2OrHttp11Codec"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$H2OrHttp11Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientConfig$ReactorNettyHttpClientUpgradeHandler"
+		},
+		"name": "reactor.netty.http.client.HttpClientConfig$ReactorNettyHttpClientUpgradeHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.HttpClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.HttpTrafficHandler"
+		},
+		"name": "reactor.netty.http.client.HttpTrafficHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.MicrometerHttpClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.MicrometerHttpClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.MicrometerWebSocketClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.MicrometerWebSocketClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.client.WebSocketClientMetricsHandler"
+		},
+		"name": "reactor.netty.http.client.WebSocketClientMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.AbstractHttpServerMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.AbstractHttpServerMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.ContextAwareHttpServerMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.ContextAwareHttpServerMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HAProxyMessageDetector"
+		},
+		"name": "reactor.netty.http.server.HAProxyMessageDetector",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HAProxyMessageReader"
+		},
+		"name": "reactor.netty.http.server.HAProxyMessageReader",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http2StreamBridgeServerHandler"
+		},
+		"name": "reactor.netty.http.server.Http2StreamBridgeServerHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http2WebsocketServerOperations$WebsocketServerHandshaker$WebsocketStreamBridgeServerHandler"
+		},
+		"name": "reactor.netty.http.server.Http2WebsocketServerOperations$WebsocketServerHandshaker$WebsocketStreamBridgeServerHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http2WebsocketServerOperations$WebsocketServerExtensionHandler"
+		},
+		"name": "reactor.netty.http.server.Http2WebsocketServerOperations$WebsocketServerExtensionHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$H2ChannelMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$H2ChannelMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$H2CleartextCodec"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$H2CleartextCodec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$H2Codec"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$H2Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$H2OrHttp11Codec"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$H2OrHttp11Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$Http11OrH2CleartextCodec"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$Http11OrH2CleartextCodec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http3ChannelInitializer"
+		},
+		"name": "reactor.netty.http.server.Http3ChannelInitializer",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http3Codec"
+		},
+		"name": "reactor.netty.http.server.Http3Codec",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.Http3StreamBridgeServerHandler"
+		},
+		"name": "reactor.netty.http.server.Http3StreamBridgeServerHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$ProtocolHeaderHandler"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$ProtocolHeaderHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerConfig$ReactorNettyHttpServerUpgradeHandler"
+		},
+		"name": "reactor.netty.http.server.HttpServerConfig$ReactorNettyHttpServerUpgradeHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpServerMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.HttpServerMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.HttpTrafficHandler"
+		},
+		"name": "reactor.netty.http.server.HttpTrafficHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.IdleTimeoutHandler"
+		},
+		"name": "reactor.netty.http.IdleTimeoutHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.MicrometerHttpServerMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.MicrometerHttpServerMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.NonSslRedirectDetector"
+		},
+		"name": "reactor.netty.http.server.NonSslRedirectDetector",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.NonSslRedirectHandler"
+		},
+		"name": "reactor.netty.http.server.NonSslRedirectHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.SimpleCompressionHandler"
+		},
+		"name": "reactor.netty.http.server.SimpleCompressionHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.WebsocketServerOperations$WebsocketHttpServerMetricsHandler"
+		},
+		"name": "reactor.netty.http.server.WebsocketServerOperations$WebsocketHttpServerMetricsHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.AccessLogHandlerH1"
+		},
+		"name": "reactor.netty.http.server.logging.AccessLogHandlerH1",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.AccessLogHandlerH2"
+		},
+		"name": "reactor.netty.http.server.logging.AccessLogHandlerH2",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.AccessLogHandlerH3"
+		},
+		"name": "reactor.netty.http.server.logging.AccessLogHandlerH3",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.BaseAccessLogHandler"
+		},
+		"name": "reactor.netty.http.server.logging.BaseAccessLogHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.error.DefaultErrorLogHandler"
+		},
+		"name": "reactor.netty.http.server.logging.error.DefaultErrorLogHandler",
+		"queryAllPublicMethods": true
+	},
+	{
+		"condition": {
+			"typeReachable": "reactor.netty.http.server.logging.error.BaseErrorLogHandler"
+		},
+		"name": "reactor.netty.http.server.logging.error.BaseErrorLogHandler",
+		"queryAllPublicMethods": true
+	}
+]

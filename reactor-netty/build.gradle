@@ -1,0 +1,92 @@
+/*
+ * Copyright (c) 2020-2026 VMware, Inc. or its affiliates, All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+dependencies {
+	api project(':reactor-netty-core')
+	api project(':reactor-netty-http')
+
+	compileOnly "io.micrometer:micrometer-core:$micrometerVersion"
+	compileOnly "io.micrometer:micrometer-tracing:$micrometerTracingVersion"
+	compileOnly "io.micrometer:context-propagation:$contextPropagationVersion"
+	compileOnly "io.netty:netty-codec-haproxy:$nettyVersion"
+	compileOnly "io.netty:netty-transport-native-kqueue:$nettyVersion"
+	compileOnly "io.netty.incubator:netty-incubator-transport-native-io_uring:$nettyIoUringVersion"
+	compileOnly "io.netty:netty-transport-native-io_uring:$nettyVersion"
+	compileOnly "io.projectreactor.addons:reactor-pool:$reactorPoolVersion"
+}
+
+jar {
+	manifest {
+		attributes("Automatic-Module-Name": "reactor.netty")
+	}
+}
+
+description = "Reactor Netty with all modules"
+
+task docsZip(type: Zip) {
+	group = 'Distribution'
+	archiveClassifier = 'docs'
+	duplicatesStrategy = "fail"
+
+	dependsOn(':docs:antora')
+
+	def isSnapshot = project.version.endsWith('-SNAPSHOT')
+	def version = isSnapshot ? project.version.takeWhile { it != '-' } : project.version
+	boolean forcePdf = project.hasProperty('forcePdf')
+
+	from ('../docs/build/site') {
+		into 'docs'
+		// Antora's site-mapper and atlas-extension stamp the current time into these
+		// files on every build (sitemap.xml's <lastmod>, site-manifest.json's "generated"),
+		// which breaks reproducible builds. Normalize them to a fixed value.
+		filesMatching('sitemap.xml') {
+			filter { line -> line.replaceAll(/<lastmod>[^<]*<\/lastmod>/, '<lastmod>1980-02-01T00:00:00.000Z</lastmod>') }
+		}
+		filesMatching('site-manifest.json') {
+			filter { line -> line.replaceAll(/"generated": "[^"]*"/, '"generated": "1980-02-01T00:00:00.000Z"') }
+		}
+	}
+
+	from("${rootDir}/docs/src/docs/dist") {
+		include "LICENSE"
+	}
+
+	if (!isSnapshot || forcePdf) {
+		def pdfFile = file("../docs/build/assembler/pdf/reactor-netty/_exports/index.pdf")
+		logger.lifecycle("${pdfFile} will be included in docs zip")
+		from(pdfFile) {
+			rename { fileName ->
+				"docs/reactor-netty-reference-guide-${project.version}.pdf"
+			}
+		}
+	}
+}
+
+def aggregateProjects = [':reactor-netty-core', ':reactor-netty-http', ':reactor-netty-quic']
+
+task aggregateJavadoc(type: Javadoc) {
+	group = "Documentation"
+	description = "Generates the aggregate Javadoc"
+	dependsOn aggregateProjects.collect { "${it}:jar" }
+	source aggregateProjects.collect { project(it).sourceSets.main.allJava }
+	classpath = files(aggregateProjects.collect { project(it).sourceSets.main.compileClasspath })
+}
+
+javadoc.dependsOn(aggregateJavadoc)
+
+//add docs.zip to the publication
+afterEvaluate {
+	publishing.publications.mavenJava.artifact(docsZip)
+}
